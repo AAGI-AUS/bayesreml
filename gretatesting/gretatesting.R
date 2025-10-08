@@ -37,7 +37,6 @@ library(Matrix)
 library(bayesplot)
 library(coda)
 
-
 # organise the dataset and create a directory for outputs
 ##################
 data(barrero.maize)
@@ -102,6 +101,7 @@ sample_sizes_vec <- 1:length(years_vec)*0
 # run through 2000:2001, 2000:2002, ..., 2000:length(years_vec)
 # for (i1 in 2:length(years_vec)) {
 i1 = 2
+#' FKCH: Using a fixed subset of years as an example to keep things simple. You can revert this back to a for loop and save results later...
     
     years_needed <- years_vec[1:i1]
     #seed_local <- rand_seeds_vec[i1]
@@ -139,11 +139,17 @@ i1 = 2
     
     ##--------------------
     # Model in asreml (benchmark)
+    #' FKCH: Since I do not won asreml, then I asked Emi to run the (simpler) model and save the results on GitHub. Thanks to Emi!
     ##--------------------
-    m1 <- asreml::asreml(yield ~ env, data = data_work,
-                         random = ~ gen + gen:env,
-                         residual = ~ dsum( ~ units|env),
-                         workspace="500mb")
+    # m1_asreml <- asreml::asreml(yield ~ env, data = data_work,
+    #                      random = ~ gen + gen:env,
+    #                      residual = ~ dsum( ~ units|env),
+    #                      workspace="500mb")
+    
+    m1_asreml_fixed <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-fixed.rds")
+    m1_asreml_random <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-random.rds")
+    m1_asreml_varcomp <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-vcomp.rds")
+    
     
     ##--------------------
     # Start greta model
@@ -211,24 +217,23 @@ i1 = 2
     ##--------------------
     # Calculate the linear predictor mu
     # Combines fixed and random effects using indices
-    mu <- mu_fixed
-        # u_gen[data_work$gen_numeric] +
+    mu <- mu_fixed +
+        u_gen[data_work$gen_numeric] +
         # u_rep_env[data_work$repenv_numeric] +
         # u_gen_year[data_work$genyear_numeric] +
         # u_gen_loc[data_work$genloc_numeric] +
-        # u_gen_env[data_work$genenv_numeric]
+        u_gen_env[data_work$genenv_numeric]
 
     # Half-Cauchy priors for environment-specific residual sd
     # Map residual sds to observations based on environment
-    # sigma_resid_env <- cauchy(0, 10, truncation = c(0, Inf), dim = length(unique(data_work$env)))
-    # sigma_resid_vec <- sigma_resid_env[data_work$env_numeric]
-    sigma_resid <- cauchy(0, 10, truncation = c(0, Inf))
+    sigma_resid_env <- cauchy(0, 10, truncation = c(0, Inf), dim = length(unique(data_work$env_numeric)))
+    sigma_resid_vec <- sigma_resid_env[data_work$env_numeric]
 
     # Observed outcome data to greta format
     y <- greta::as_data(data_work$yield)
     
     # Specify the likelihood: normal distribution with mean mu and sd sigma_resid_vec
-    distribution(y) <- greta::normal(mu, sigma_resid)
+    distribution(y) <- greta::normal(mu, sigma_resid_vec)
     
     
     ##--------------------
@@ -237,14 +242,15 @@ i1 = 2
     # Compile the greta model, tracking key parameters
     model_fit <- greta::model(beta_intercept,
                               beta_env, 
-                              #sigma_gen, 
+                              sigma_gen, 
                               #sigma_rep_env,
                               #sigma_gen_year, 
                               #sigma_gen_loc, 
-                              #sigma_gen_env,
-                              #sigma_resid_env)
-                              sigma_resid)
-    
+                              sigma_gen_env,
+                              sigma_resid_env,
+                              u_gen,
+                              u_gen_env)
+                              
     
     # Run MCMC sampling for Bayesian inference (n_samples and warmup can be increased)
     m1 <- lm(yield ~ env, data = data_work)
@@ -256,21 +262,56 @@ i1 = 2
                             n_cores = 4)
     
     
-    # Examine results -- using the posterior median and quantiles as a basic check to start off with
+    ##--------------------
+    # Examine results -- using the posterior median and quantiles from greta as a basic check to start off with
+    ##--------------------
     get_quantiles <- summary(m1_greta)$quantiles %>% 
         as.data.frame()
     rownames(get_quantiles) <- c("Intercept",
                                  paste0("env", levels(data_work$env)), 
+                                 "sigma_variancecom_gen",
+                                 "sigma_variancecom_gen_env",
                                  # paste0("loc", rep(levels(data_work$loc), n_yearf), 
                                  #        ":yearf", rep(levels(data_work$yearf), each = n_loc)),
-                                 "sigma_residual")
-    get_quantiles <- get_quantiles %>% 
-        filter(`50%` != 0)
+                                 paste0("sigma_residual_env", levels(data_work$env)),
+                                 paste0("gen_", levels(data_work$gen)),
+                                 interaction(paste0("gen_", data_work$gen), paste0("env_", data_work$env), sep = ":") %>% factor %>% levels())
     
-    get_quantiles[,"50%"] %>% 
-        setNames(., rownames(get_quantiles))
-    m1$coefficients %>% 
-        na.omit
+    
+    ## Fixed effects
+    data.frame(asreml = m1_asreml_fixed$estimate %>% setNames(m1_asreml_fixed$term),
+               greta = get_quantiles[1:(1+length(levels(data_work$env))), "50%"])
+
+    
+    ## Variance components
+    data.frame(asreml = m1_asreml_varcomp$estimate %>% setNames(m1_asreml_varcomp$term),
+               greta = get_quantiles^2 %>% filter(str_detect(rownames(get_quantiles), "sigma_")) %>% pull(`50%`))
+    
+    
+    ## Random effects 
+    #' FKCH: Note this is slightly more finnicky to compare as the order of the levels in the interaction differ between asreml and greta
+    data.frame(asreml = m1_asreml_random %>% 
+                   filter(estimate != 0) %>% 
+                   select(term, estimate) %>%
+                   dplyr::slice(1:length(table(data_work$gen)))
+               ) %>% 
+        mutate(greta = get_quantiles %>% 
+                   filter(str_detect(rownames(get_quantiles), "^gen_")) %>% 
+                   dplyr::slice(1:length(table(data_work$gen))) %>% 
+                   pull(`50%`))
+    
+    left_join(m1_asreml_random %>% 
+                   filter(estimate != 0) %>% 
+                   select(term, estimate) %>%
+                   dplyr::slice(-(1:length(table(data_work$gen)))),
+              get_quantiles %>% 
+                  filter(str_detect(rownames(get_quantiles), "^gen_")) %>% 
+                  dplyr::slice(-(1:length(table(data_work$gen)))) %>% 
+                  rownames_to_column(var = "term") %>%
+                  select(term, `50%`),
+              by = "term") %>% 
+        print(n = Inf)
+    
     
     
     exec_time1 <- proc.time() - ptm1
