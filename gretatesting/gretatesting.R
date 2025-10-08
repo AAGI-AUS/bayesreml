@@ -22,10 +22,8 @@
 
 # the asreml model, see R agridat::barrero.maize
 ##################
-# m1 <- asreml::asreml(yield ~ loc*yearf, data=dat,
-#                random = ~ gen + rep:env +
-#                  gen:yearf + gen:loc +
-#                  gen:env,
+# m1 <- asreml::asreml(yield ~ env, data=dat,
+#                random = ~ gen + gen:env,
 #                residual = ~ dsum( ~ units|env),
 #                workspace="500mb")
 ##################
@@ -102,7 +100,8 @@ set.seed(55)
 sample_sizes_vec <- 1:length(years_vec)*0
 
 # run through 2000:2001, 2000:2002, ..., 2000:length(years_vec)
-for (i1 in 2:length(years_vec)) {
+# for (i1 in 2:length(years_vec)) {
+i1 = 2
     
     years_needed <- years_vec[1:i1]
     #seed_local <- rand_seeds_vec[i1]
@@ -141,10 +140,8 @@ for (i1 in 2:length(years_vec)) {
     ##--------------------
     # Model in asreml (benchmark)
     ##--------------------
-    m1 <- asreml::asreml(yield ~ loc*yearf, data = data_work,
-                         random = ~ gen + rep:env +
-                             gen:yearf + gen:loc +
-                             gen:env,
+    m1 <- asreml::asreml(yield ~ env, data = data_work,
+                         random = ~ gen + gen:env,
                          residual = ~ dsum( ~ units|env),
                          workspace="500mb")
     
@@ -156,48 +153,39 @@ for (i1 in 2:length(years_vec)) {
     ptm1 <- proc.time() 
     
     # Define priors for fixed effects coefficients using index approach
-    n_loc <- table(data_work$loc_numeric) %>% length
-    n_yearf <- table(data_work$yearf_numeric) %>% length
+    n_env <- table(data_work$env_numeric) %>% length
 
     # Intercept
     beta_intercept <- normal(0, 10)
     
-    # Fixed effect for loc (first level set as a reference)
-    beta_loc <- greta_array(dim = n_loc)
-    beta_loc[1] <- 0
-    beta_loc[2:n_loc] <- normal(0, 10, dim = n_loc - 1)
+    # Fixed effect for env (first level set as a reference)
+    beta_env <- greta_array(dim = n_env)
+    beta_env[1] <- 0
+    beta_env[2:n_env] <- normal(0, 10, dim = n_env - 1)
     
-    # Fixed effect for yearf (first level set as a reference)
-    beta_yearf <- greta_array(dim = n_yearf)
-    beta_yearf[1] <- 0
-    beta_yearf[2:n_yearf] <- normal(0, 10, dim = n_yearf - 1)
-    
-    # Fixed effect for env, which is effectively the interaction between loc and yearf
-    beta_env <- greta_array(dim = c(n_loc, n_yearf))
-    beta_env[1,] <- 0
-    beta_env[,1] <- 0
-    beta_env[2:n_loc, 2:n_yearf] <- normal(0, 10, dim = (n_loc-1)*(n_yearf-1))
-    
-    ## Check if any of interactions are missing in the data
-    #' There are probably more precise ways to do this, but for now I will cheat and use the estimated lm model to work this out
-    m1 <- lm(yield ~ loc*yearf, data = data_work)
-    get_env_coefs <- m1$coefficients[-(1:(1+n_loc-1+n_yearf-1))] %>% 
-        matrix(ncol = n_yearf-1, byrow = FALSE)
-    find_missing_interactions <- which(is.na(get_env_coefs), arr.ind = TRUE)
-    if (nrow(find_missing_interactions) > 0) {
-        for (i2 in 1:nrow(find_missing_interactions)) {
-            beta_env[find_missing_interactions[i2,1]+1, find_missing_interactions[i2,2]+1] <- 0
-        }
-    }
-    rm(find_missing_interactions, get_env_coefs)
+    #' # Fixed effect for env, which is effectively the interaction between loc and yearf
+    #' beta_env <- greta_array(dim = c(n_loc, n_yearf))
+    #' beta_env[1,] <- 0
+    #' beta_env[,1] <- 0
+    #' beta_env[2:n_loc, 2:n_yearf] <- normal(0, 10, dim = (n_loc-1)*(n_yearf-1))
+    #' 
+    #' ## Check if any of interactions are missing in the data
+    #' #' There are probably more precise ways to do this, but for now I will cheat and use the estimated lm model to work this out
+    #' m1 <- lm(yield ~ loc*yearf, data = data_work)
+    #' get_env_coefs <- m1$coefficients[-(1:(1+n_loc-1+n_yearf-1))] %>% 
+    #'     matrix(ncol = n_yearf-1, byrow = FALSE)
+    #' find_missing_interactions <- which(is.na(get_env_coefs), arr.ind = TRUE)
+    #' if (nrow(find_missing_interactions) > 0) {
+    #'     for (i2 in 1:nrow(find_missing_interactions)) {
+    #'         beta_env[find_missing_interactions[i2,1]+1, find_missing_interactions[i2,2]+1] <- 0
+    #'     }
+    #' }
+    #' rm(find_missing_interactions, get_env_coefs)
     
     
     # Build linear predictor for fixed part
-    mu_fixed <- beta_intercept +
-        beta_loc[data_work$loc_numeric] +
-        beta_yearf[data_work$yearf_numeric] +
-        beta_env[cbind(data_work$loc_numeric, data_work$yearf_numeric)]
-    
+    mu_fixed <- beta_intercept + beta_env[data_work$env_numeric]
+
     
     ##--------------------
     # Random effects component
@@ -205,17 +193,17 @@ for (i1 in 2:length(years_vec)) {
     # Define priors for random effect standard deviations
     # Half-Cauchy priors are standard for variance components
     sigma_gen <- cauchy(0, 10, truncation = c(0, Inf))
-    sigma_rep_env  <- cauchy(0, 10, truncation = c(0, Inf))
-    sigma_gen_year <- cauchy(0, 10, truncation = c(0, Inf))
-    sigma_gen_loc  <- cauchy(0, 10, truncation = c(0, Inf))
+    #sigma_rep_env  <- cauchy(0, 10, truncation = c(0, Inf))
+    #sigma_gen_year <- cauchy(0, 10, truncation = c(0, Inf))
+    #sigma_gen_loc  <- cauchy(0, 10, truncation = c(0, Inf))
     sigma_gen_env  <- cauchy(0, 10, truncation = c(0, Inf))
     
     # Define random effects
     # Each follows a normal distribution with mean 0 and respective sd
     u_gen <- normal(0, sigma_gen, dim = length(table(data_work$gen_numeric)))
-    u_rep_env <- normal(0, sigma_rep_env, dim = length(table(data_work$repenv_numeric)))
-    u_gen_year <- normal(0, sigma_gen_year, dim = length(table(data_work$genyear_numeric)))
-    u_gen_loc <- normal(0, sigma_gen_loc, dim = length(table(data_work$genloc_numeric)))
+    # u_rep_env <- normal(0, sigma_rep_env, dim = length(table(data_work$repenv_numeric)))
+    # u_gen_year <- normal(0, sigma_gen_year, dim = length(table(data_work$genyear_numeric)))
+    # u_gen_loc <- normal(0, sigma_gen_loc, dim = length(table(data_work$genloc_numeric)))
     u_gen_env <- normal(0, sigma_gen_env, dim = length(table(data_work$genenv_numeric)))
     
     ##--------------------
@@ -248,8 +236,6 @@ for (i1 in 2:length(years_vec)) {
     ##--------------------
     # Compile the greta model, tracking key parameters
     model_fit <- greta::model(beta_intercept,
-                              beta_loc, 
-                              beta_yearf, 
                               beta_env, 
                               #sigma_gen, 
                               #sigma_rep_env,
@@ -261,6 +247,7 @@ for (i1 in 2:length(years_vec)) {
     
     
     # Run MCMC sampling for Bayesian inference (n_samples and warmup can be increased)
+    m1 <- lm(yield ~ env, data = data_work)
     m1_greta <- greta::mcmc(model_fit, 
                             n_samples = 1000, 
                             warmup = 1000, 
@@ -273,10 +260,9 @@ for (i1 in 2:length(years_vec)) {
     get_quantiles <- summary(m1_greta)$quantiles %>% 
         as.data.frame()
     rownames(get_quantiles) <- c("Intercept",
-                                 paste0("loc", levels(data_work$loc)), 
-                                 paste0("yearf", levels(data_work$yearf)), 
-                                 paste0("loc", rep(levels(data_work$loc), n_yearf), 
-                                        ":yearf", rep(levels(data_work$yearf), each = n_loc)),
+                                 paste0("env", levels(data_work$env)), 
+                                 # paste0("loc", rep(levels(data_work$loc), n_yearf), 
+                                 #        ":yearf", rep(levels(data_work$yearf), each = n_loc)),
                                  "sigma_residual")
     get_quantiles <- get_quantiles %>% 
         filter(`50%` != 0)
@@ -300,4 +286,4 @@ for (i1 in 2:length(years_vec)) {
     rm(model_fit, m1_greta, y, u_gen_year, u_gen_loc, u_gen_env)
     
     
-} # ends for (i1 in 2:s1)
+# } # ends for (i1 in 2:s1)
