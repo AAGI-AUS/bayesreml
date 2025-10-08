@@ -1,5 +1,6 @@
 library(tidyverse)
 library(asreml)
+library(broom.asreml)
 dat <- agridat::barrero.maize |> 
     transform(yearf = factor(year))
 
@@ -40,3 +41,8 @@ m2 <- asreml(
 m2$converge
 
 saveRDS(m2, here::here("outputs/01-asreml-barrero-maize-m2.rds"))
+saveRDS(tidy(m2, "random"), here::here("outputs/01-asreml-barrero-maize-m2-random.rds"))
+saveRDS(tidy(m2, "fixed"), here::here("outputs/01-asreml-barrero-maize-m2-fixed.rds"))
+saveRDS(tidy(m2, "vcomp"), here::here("outputs/01-asreml-barrero-maize-m2-vcomp.rds"))
+
+tidy()
