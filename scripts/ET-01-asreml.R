@@ -29,6 +29,7 @@ broom.asreml::tidy(m1, "random")
 dat <- agridat::barrero.maize |> 
     filter(year %in% 2000:2001) |> 
     mutate(yearf = factor(year)) |> 
+    select(-c("yor", "daystoflower", "plantheight", "earheight", "population", "lodged", "moisture", "testweight")) |> 
     na.omit()
 
 m2 <- asreml(
@@ -45,4 +46,3 @@ saveRDS(tidy(m2, "random"), here::here("outputs/01-asreml-barrero-maize-m2-rando
 saveRDS(tidy(m2, "fixed"), here::here("outputs/01-asreml-barrero-maize-m2-fixed.rds"))
 saveRDS(tidy(m2, "vcomp"), here::here("outputs/01-asreml-barrero-maize-m2-vcomp.rds"))
 
-tidy()
