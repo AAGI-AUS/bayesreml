@@ -22,10 +22,19 @@
 
 # the asreml model, see R agridat::barrero.maize
 ##################
-# m1 <- asreml::asreml(yield ~ env, data=dat,
-#                random = ~ gen + gen:env,
-#                residual = ~ dsum( ~ units|env),
-#                workspace="500mb")
+# dat <- agridat::barrero.maize |> 
+#     filter(year %in% 2000:2001) |> 
+#     mutate(yearf = factor(year)) |> 
+#     select(-c("yor", "daystoflower", "plantheight", "earheight", "population", "lodged", "moisture", "testweight")) |> 
+#     na.omit()
+# 
+# m2 <- asreml(
+#     yield ~ env,
+#     data = dat,
+#     random = ~ gen + gen:env,
+#     residual = ~ dsum(~ units | env),
+#     workspace = "500mb"
+# )
 ##################
 
 
@@ -139,16 +148,11 @@ i1 = 2
     
     ##--------------------
     # Model in asreml (benchmark)
-    #' FKCH: Since I do not won asreml, then I asked Emi to run the (simpler) model and save the results on GitHub. Thanks to Emi!
+    #' FKCH: Since I do not own asreml, then I asked Emi to run the (simpler) model and save the results on GitHub. Thanks to Emi!
     ##--------------------
-    # m1_asreml <- asreml::asreml(yield ~ env, data = data_work,
-    #                      random = ~ gen + gen:env,
-    #                      residual = ~ dsum( ~ units|env),
-    #                      workspace="500mb")
-    
-    m1_asreml_fixed <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-fixed.rds")
-    m1_asreml_random <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-random.rds")
-    m1_asreml_varcomp <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-vcomp.rds")
+    m2_asreml_fixed <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-fixed.rds")
+    m2_asreml_random <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-random.rds")
+    m2_asreml_varcomp <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-vcomp.rds")
     
     
     ##--------------------
@@ -279,18 +283,18 @@ i1 = 2
     
     
     ## Fixed effects
-    data.frame(asreml = m1_asreml_fixed$estimate %>% setNames(m1_asreml_fixed$term),
+    data.frame(asreml = m2_asreml_fixed$estimate %>% setNames(m2_asreml_fixed$term),
                greta = get_quantiles[1:(1+length(levels(data_work$env))), "50%"])
 
     
     ## Variance components
-    data.frame(asreml = m1_asreml_varcomp$estimate %>% setNames(m1_asreml_varcomp$term),
+    data.frame(asreml = m2_asreml_varcomp$estimate %>% setNames(m2_asreml_varcomp$term),
                greta = get_quantiles^2 %>% filter(str_detect(rownames(get_quantiles), "sigma_")) %>% pull(`50%`))
     
     
     ## Random effects 
     #' FKCH: Note this is slightly more finnicky to compare as the order of the levels in the interaction differ between asreml and greta
-    data.frame(asreml = m1_asreml_random %>% 
+    data.frame(asreml = m2_asreml_random %>% 
                    filter(estimate != 0) %>% 
                    select(term, estimate) %>%
                    dplyr::slice(1:length(table(data_work$gen)))
@@ -300,7 +304,7 @@ i1 = 2
                    dplyr::slice(1:length(table(data_work$gen))) %>% 
                    pull(`50%`))
     
-    left_join(m1_asreml_random %>% 
+    left_join(m2_asreml_random %>% 
                    filter(estimate != 0) %>% 
                    select(term, estimate) %>%
                    dplyr::slice(-(1:length(table(data_work$gen)))),
