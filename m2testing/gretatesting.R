@@ -2,7 +2,7 @@
 # 
 # One more minor improvement made is replacing `as.numeric` with `as.integer` for factors.
 # 
-# From eyeballing outputs, `summary(m1_greta)` estimates still differ from the initial "model.matrix" approach.
+# From eyeballing outputs, `summary(m2_greta)` estimates still differ from the initial "model.matrix" approach.
 
 # source("r_code_04a_greta_test_v4.R")
 
@@ -258,7 +258,7 @@ i1 = 2
     
     # Run MCMC sampling for Bayesian inference (n_samples and warmup can be increased)
     m1 <- lm(yield ~ env, data = data_work)
-    m1_greta <- greta::mcmc(model_fit, 
+    m2_greta <- greta::mcmc(model_fit, 
                             n_samples = 1000, 
                             warmup = 1000, 
                             initial_values = initials(beta_intercept = m1$coefficients[1]),
@@ -269,7 +269,7 @@ i1 = 2
     ##--------------------
     # Examine results -- using the posterior median and quantiles from greta as a basic check to start off with
     ##--------------------
-    get_quantiles <- summary(m1_greta)$quantiles %>% 
+    get_quantiles <- summary(m2_greta)$quantiles %>% 
         as.data.frame()
     rownames(get_quantiles) <- c("Intercept",
                                  paste0("env", levels(data_work$env)), 
@@ -326,9 +326,9 @@ i1 = 2
     
     # save the results
     file_names <- paste0(dir_out, "r_out_04a_greta_test_", i1, "_2000_",  years_vec[i1] ,".RData")
-    #save(m1_greta, exec_time1, years_vec, seed_local, file = file_names)
+    #save(m2_greta, exec_time1, years_vec, seed_local, file = file_names)
     
-    rm(model_fit, m1_greta, y, u_gen_year, u_gen_loc, u_gen_env)
+    rm(model_fit, m2_greta, y, u_gen_year, u_gen_loc, u_gen_env)
     
     
 # } # ends for (i1 in 2:s1)
