@@ -36,8 +36,6 @@
 #     workspace = "500mb"
 # )
 ##################
-
-
 rm(list = ls())
 library(tidyverse)
 library(agridat)
@@ -45,6 +43,8 @@ library(greta)
 library(Matrix)
 library(bayesplot)
 library(coda)
+here::i_am("m2testing/gretatesting.R")
+library(here)
 
 # organise the dataset and create a directory for outputs
 ##################
@@ -150,9 +150,9 @@ i1 = 2
     # Model in asreml (benchmark)
     #' FKCH: Since I do not own asreml, then I asked Emi to run the (simpler) model and save the results on GitHub. Thanks to Emi!
     ##--------------------
-    m2_asreml_fixed <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-fixed.rds")
-    m2_asreml_random <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-random.rds")
-    m2_asreml_varcomp <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-vcomp.rds")
+    m2_asreml_fixed <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-fixed.rds"))
+    m2_asreml_random <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-random.rds"))
+    m2_asreml_varcomp <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-vcomp.rds"))
     
     
     ##--------------------
