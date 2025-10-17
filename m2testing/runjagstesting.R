@@ -19,8 +19,6 @@
 #     workspace = "500mb"
 # )
 ##################
-
-
 rm(list = ls())
 library(tidyverse)
 library(agridat)
@@ -28,6 +26,8 @@ library(runjags)
 library(Matrix)
 library(bayesplot)
 library(coda)
+here::i_am("m2testing/runjagstesting.R")
+library(here)
 
 # organise the dataset and create a directory for outputs
 ##################
@@ -67,17 +67,26 @@ data_initial <- data_initial %>%
 #     }
 
 
-package_name <- "greta_index"
+# package_name <- "jags_index"
+# 
+# dir_out <- paste0("dir_packages_tesing/", package_name, "/")
+#     data_initial_expended <- rbindlist(list_all_tabs)
+#     data_initial <- data_initial_expended
+#     
+#     }
 
-dir_out <- paste0("dir_packages_tesing/", package_name, "/")
-dir.create(dir_out, showWarnings = FALSE, recursive = TRUE)
 
-
-# increase the memory limites to maximum
-mem.maxVSize(vsize = Inf)
-mem.maxNSize(nsize = Inf)
-
-print(paste0("maximum sample size: ", nrow(data_initial)))
+# package_name <- "jags_index"
+# 
+# dir_out <- paste0("dir_packages_tesing/", package_name, "/")
+# dir.create(dir_out, showWarnings = FALSE, recursive = TRUE)
+# 
+# 
+# # increase the memory limites to maximum
+# mem.maxVSize(vsize = Inf)
+# mem.maxNSize(nsize = Inf)
+# 
+# print(paste0("maximum sample size: ", nrow(data_initial)))
 
 # 2000 2001 2002 2003 2004 2005 2006 2007 2008 2009 2010
 # we will be taking the datasets 2000:2001, 2000:2002, ..., 2000:2010
@@ -100,7 +109,7 @@ i1 = 2
     
     print(paste0("number of years to be processed: ", length(years_needed)))
     
-    # drop missing outcomes, as required for greta (to be investigated later)
+    # drop missing outcomes, although note jags can automatically handle this by either omitting or imputing if a distribution is assumed
     data_work <- data_initial %>%
         filter(year %in% years_needed) %>% 
         na.omit()
@@ -133,132 +142,108 @@ i1 = 2
     # Model in asreml (benchmark)
     #' FKCH: Since I do not won asreml, then I asked Emi to run the (simpler) model and save the results on GitHub. Thanks to Emi!
     ##--------------------
-    # m1_asreml <- asreml::asreml(yield ~ env, data = data_work,
+    # m2_asreml <- asreml::asreml(yield ~ env, data = data_work,
     #                      random = ~ gen + gen:env,
     #                      residual = ~ dsum( ~ units|env),
     #                      workspace="500mb")
     
-    m1_asreml_fixed <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-fixed.rds")
-    m1_asreml_random <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-random.rds")
-    m1_asreml_varcomp <- readRDS(file = "../bayesreml/outputs/01-asreml-barrero-maize-m2-vcomp.rds")
+    m2_asreml_fixed <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-fixed.rds"))
+    m2_asreml_random <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-random.rds"))
+    m2_asreml_varcomp <- readRDS(file = here("outputs", "01-asreml-barrero-maize-m2-vcomp.rds"))
     
     
     ##--------------------
-    # Start greta model
-    ## Fixed effects component
+    # Start runjags model
     ##--------------------
     # computational time
     ptm1 <- proc.time() 
-    
-    # Define priors for fixed effects coefficients using index approach
-    n_env <- table(data_work$env_numeric) %>% length
 
-    # Intercept
-    beta_intercept <- normal(0, 10)
+    env_numeric <- data_work$env_numeric
+    gen_numeric <- data_work$gen_numeric
+    genenv_numeric <- data_work$genenv_numeric
+    n_env <- table(env_numeric) %>% length
+    n_gen <- table(gen_numeric) %>% length
+    n_genenv <- table(genenv_numeric) %>% length
+    N <- nrow(data_work)
+    y <- data_work$yield
     
-    # Fixed effect for env (first level set as a reference)
-    beta_env <- greta_array(dim = n_env)
-    beta_env[1] <- 0
-    beta_env[2:n_env] <- normal(0, 10, dim = n_env - 1)
-    
-    #' # Fixed effect for env, which is effectively the interaction between loc and yearf
-    #' beta_env <- greta_array(dim = c(n_loc, n_yearf))
-    #' beta_env[1,] <- 0
-    #' beta_env[,1] <- 0
-    #' beta_env[2:n_loc, 2:n_yearf] <- normal(0, 10, dim = (n_loc-1)*(n_yearf-1))
-    #' 
-    #' ## Check if any of interactions are missing in the data
-    #' #' There are probably more precise ways to do this, but for now I will cheat and use the estimated lm model to work this out
-    #' m1 <- lm(yield ~ loc*yearf, data = data_work)
-    #' get_env_coefs <- m1$coefficients[-(1:(1+n_loc-1+n_yearf-1))] %>% 
-    #'     matrix(ncol = n_yearf-1, byrow = FALSE)
-    #' find_missing_interactions <- which(is.na(get_env_coefs), arr.ind = TRUE)
-    #' if (nrow(find_missing_interactions) > 0) {
-    #'     for (i2 in 1:nrow(find_missing_interactions)) {
-    #'         beta_env[find_missing_interactions[i2,1]+1, find_missing_interactions[i2,2]+1] <- 0
-    #'     }
-    #' }
-    #' rm(find_missing_interactions, get_env_coefs)
-    
-    
-    # Build linear predictor for fixed part
-    mu_fixed <- beta_intercept + beta_env[data_work$env_numeric]
+    model <- "model {
+        # Fixed effects component
+        beta_intercept ~ dnorm(0, 0.01)
 
+        # Fixed effect for env (first level set as a reference)
+        # The first level is fixed to 0 (reference level).
+        beta_env[1] <- 0
+
+        for (j in 2:n_env) { #data# n_env
+              beta_env[j] ~ dnorm(0, 0.01)
+              }        
     
-    ##--------------------
-    # Random effects component
-    ##--------------------
-    # Define priors for random effect standard deviations
-    # Half-Cauchy priors are standard for variance components
-    sigma_gen <- cauchy(0, 10, truncation = c(0, Inf))
-    #sigma_rep_env  <- cauchy(0, 10, truncation = c(0, Inf))
-    #sigma_gen_year <- cauchy(0, 10, truncation = c(0, Inf))
-    #sigma_gen_loc  <- cauchy(0, 10, truncation = c(0, Inf))
-    sigma_gen_env  <- cauchy(0, 10, truncation = c(0, Inf))
+        # Random effects component
+        # Define priors for random effect standard deviations
+        # Half-Cauchy priors are standard for variance components
+        sigma_gen ~ dt(0, 0.01, 1)T(0,)
+        #sigma_rep_env ~ dt(0, 0.01, 1)T(0,)
+        #sigma_gen_year ~ dt(0, 0.01, 1)T(0,)
+        #sigma_gen_loc ~ dt(0, 0.01, 1)T(0,)
+        sigma_gen_env ~ dt(0, 0.01, 1)T(0,)
     
-    # Define random effects
-    # Each follows a normal distribution with mean 0 and respective sd
-    u_gen <- normal(0, sigma_gen, dim = length(table(data_work$gen_numeric)))
-    # u_rep_env <- normal(0, sigma_rep_env, dim = length(table(data_work$repenv_numeric)))
-    # u_gen_year <- normal(0, sigma_gen_year, dim = length(table(data_work$genyear_numeric)))
-    # u_gen_loc <- normal(0, sigma_gen_loc, dim = length(table(data_work$genloc_numeric)))
-    u_gen_env <- normal(0, sigma_gen_env, dim = length(table(data_work$genenv_numeric)))
     
-    ##--------------------
-    # Outcome model
-    ##--------------------
-    # Calculate the linear predictor mu
-    # Combines fixed and random effects using indices
-    mu <- mu_fixed +
-        u_gen[data_work$gen_numeric] +
+        # Define random effects
+        for (i in 1:n_gen) { #data# n_gen
+            u_gen[i] ~ dnorm(0, pow(sigma_gen, -2))
+            }
+        # u_rep_env ~ normal(0, sigma_rep_env, dim = length(table(data_work$repenv_numeric)))
+        # u_gen_year ~ normal(0, sigma_gen_year, dim = length(table(data_work$genyear_numeric)))
+        # u_gen_loc ~ normal(0, sigma_gen_loc, dim = length(table(data_work$genloc_numeric)))
+        for (i in 1:n_genenv) { #data# n_genenv
+            u_gen_env[i] ~ dnorm(0, pow(sigma_gen_env, -2))
+            }
+        
+        
+        # Outcome model
+        # Calculate the linear predictor mu
+        # Combines fixed and random effects using indices
+        for(i in 1:N) { #data# N
+            mu[i] <- beta_intercept + beta_env[env_numeric[i]] + u_gen[gen_numeric[i]] + u_gen_env[genenv_numeric[i]] 
+            #data# env_numeric, gen_numeric, genenv_numeric
+            }  
         # u_rep_env[data_work$repenv_numeric] +
         # u_gen_year[data_work$genyear_numeric] +
         # u_gen_loc[data_work$genloc_numeric] +
-        u_gen_env[data_work$genenv_numeric]
 
-    # Half-Cauchy priors for environment-specific residual sd
-    # Map residual sds to observations based on environment
-    sigma_resid_env <- cauchy(0, 10, truncation = c(0, Inf), dim = length(unique(data_work$env_numeric)))
-    sigma_resid_vec <- sigma_resid_env[data_work$env_numeric]
+    
+        # Half-Cauchy priors for environment-specific residual sd
+        # Map residual sds to observations based on environment
+        for(j in 1:n_env) { 
+            sigma_resid_env[j] ~ dt(0, 0.01, 1)T(0,)
+            tau_resid_env[j] <- pow(sigma_resid_env[j], -2)
+            }
+        for(i in 1:N) {
+            y[i] ~ dnorm(mu[i], tau_resid_env[env_numeric[i]]) #data# y
+            }
 
-    # Observed outcome data to greta format
-    y <- greta::as_data(data_work$yield)
     
-    # Specify the likelihood: normal distribution with mean mu and sd sigma_resid_vec
-    distribution(y) <- greta::normal(mu, sigma_resid_vec)
+    #monitor# beta_intercept, beta_env, sigma_gen, sigma_gen_env, sigma_resid_env, u_gen, u_gen_env
+    }"
     
-    
+
     ##--------------------
     ## Form model and sample...
     ##--------------------
-    # Compile the greta model, tracking key parameters
-    model_fit <- greta::model(beta_intercept,
-                              beta_env, 
-                              sigma_gen, 
-                              #sigma_rep_env,
-                              #sigma_gen_year, 
-                              #sigma_gen_loc, 
-                              sigma_gen_env,
-                              sigma_resid_env,
-                              u_gen,
-                              u_gen_env)
-                              
-    
-    # Run MCMC sampling for Bayesian inference (n_samples and warmup can be increased)
-    m1 <- lm(yield ~ env, data = data_work)
-    m1_greta <- greta::mcmc(model_fit, 
-                            n_samples = 1000, 
-                            warmup = 1000, 
-                            initial_values = initials(beta_intercept = m1$coefficients[1]),
-                            chains = 4, 
-                            n_cores = 4)
+    # Run MCMC sampling for Bayesian inference (burnin, sample, and adapt are set to defaults; these are not necessarily compatible with what brms, greta and other MCMC samples use!)
+    m2_jags <- run.jags(model = model, 
+                        n.chains = 4, 
+                        method = "parallel")
     
     
     ##--------------------
-    # Examine results -- using the posterior median and quantiles from greta as a basic check to start off with
+    # Examine results -- using the posterior median and quantiles from jags as a basic check to start off with
     ##--------------------
-    get_quantiles <- summary(m1_greta)$quantiles %>% 
-        as.data.frame()
+    s <- summary(m2_jags) #' Note this command takes a while because runjags does many of summaries. There is probably a way to produce this bad or use CODA instead, but this is a future enhancement issue
+    get_quantiles <- s %>% 
+        as.data.frame() %>% 
+        select(Lower95:Upper95) 
     rownames(get_quantiles) <- c("Intercept",
                                  paste0("env", levels(data_work$env)), 
                                  "sigma_variancecom_gen",
@@ -271,28 +256,28 @@ i1 = 2
     
     
     ## Fixed effects
-    data.frame(asreml = m1_asreml_fixed$estimate %>% setNames(m1_asreml_fixed$term),
-               greta = get_quantiles[1:(1+length(levels(data_work$env))), "50%"])
+    data.frame(asreml = m2_asreml_fixed$estimate %>% setNames(m2_asreml_fixed$term),
+               jags = get_quantiles[1:(1+length(levels(data_work$env))),] %>% pull("Median"))
 
     
     ## Variance components
-    data.frame(asreml = m1_asreml_varcomp$estimate %>% setNames(m1_asreml_varcomp$term),
-               greta = get_quantiles^2 %>% filter(str_detect(rownames(get_quantiles), "sigma_")) %>% pull(`50%`))
+    data.frame(asreml = m2_asreml_varcomp$estimate %>% setNames(m2_asreml_varcomp$term),
+               jags = get_quantiles^2 %>% filter(str_detect(rownames(get_quantiles), "sigma_")) %>% pull("Median"))
     
     
     ## Random effects 
-    #' FKCH: Note this is slightly more finnicky to compare as the order of the levels in the interaction differ between asreml and greta
-    data.frame(asreml = m1_asreml_random %>% 
+    #' FKCH: Note this is slightly more finnicky to compare as the order of the levels in the interaction differ between asreml and jags
+    data.frame(asreml = m2_asreml_random %>% 
                    filter(estimate != 0) %>% 
                    select(term, estimate) %>%
                    dplyr::slice(1:length(table(data_work$gen)))
                ) %>% 
-        mutate(greta = get_quantiles %>% 
+        mutate(jags = get_quantiles %>% 
                    filter(str_detect(rownames(get_quantiles), "^gen_")) %>% 
                    dplyr::slice(1:length(table(data_work$gen))) %>% 
-                   pull(`50%`))
+                   pull("Median"))
     
-    left_join(m1_asreml_random %>% 
+    left_join(m2_asreml_random %>% 
                    filter(estimate != 0) %>% 
                    select(term, estimate) %>%
                    dplyr::slice(-(1:length(table(data_work$gen)))),
@@ -300,7 +285,7 @@ i1 = 2
                   filter(str_detect(rownames(get_quantiles), "^gen_")) %>% 
                   dplyr::slice(-(1:length(table(data_work$gen)))) %>% 
                   rownames_to_column(var = "term") %>%
-                  select(term, `50%`),
+                  select(term, `Median`),
               by = "term") %>% 
         print(n = Inf)
     
@@ -313,10 +298,14 @@ i1 = 2
     print(exec_time1)
     
     # save the results
-    file_names <- paste0(dir_out, "r_out_04a_greta_test_", i1, "_2000_",  years_vec[i1] ,".RData")
-    #save(m1_greta, exec_time1, years_vec, seed_local, file = file_names)
+    file_names <- paste0(dir_out, "r_out_04a_jags_test_", i1, "_2000_",  years_vec[i1] ,".RData")
+    #save(m1_jags, exec_time1, years_vec, seed_local, file = file_names)
     
-    rm(model_fit, m1_greta, y, u_gen_year, u_gen_loc, u_gen_env)
+    rm(model_fit, m1_jags, y, u_gen_year, u_gen_loc, u_gen_env)
     
     
 # } # ends for (i1 in 2:s1)
+
+    
+
+    
