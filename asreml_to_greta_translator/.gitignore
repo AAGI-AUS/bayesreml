@@ -1,0 +1,15 @@
+# Generated data files (run 01_generate_data.R to recreate)
+met_data.rds
+
+# Generated PDF outputs
+*.pdf
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# macOS
+.DS_Store
+# R App history
+.Rapp.history
