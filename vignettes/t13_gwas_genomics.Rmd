@@ -1,0 +1,595 @@
+---
+title: "Tutorial 13: GWAS and Genomic Selection"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 13: GWAS and Genomic Selection}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Genomic selection and GWAS (genome-wide association studies) rely on
+relationship matrices that encode genetic similarity among individuals. In the
+mixed model framework, these matrices replace the identity matrix typically used
+for iid random effects, producing genomic best linear unbiased predictions
+(GEBVs).
+
+This tutorial demonstrates how to construct genomic relationship matrices and
+fit genomic mixed models using `bayesreml`, with the bundled `met_example`
+dataset.
+
+**Models covered:**
+
+| Model | Description | Relationship matrix |
+|-------|-------------|---------------------|
+| m_13a | GBLUP with VanRaden G matrix | Genomic (SNP-based) |
+| m_13b | Additive GBLUP | Same G, multi-environment |
+| m_13c | Additive + dominance | G + D matrices |
+| m_13d | Epistatic (additive x additive) | G + G#G |
+
+**Key concepts:**
+
+- VanRaden Method 1 for G matrix construction
+- `vm(geno, Gmat)` syntax for structured random effects
+- Genomic heritability: $h^2_g = \sigma_g^2 / (\sigma_g^2 + \sigma_e^2)$
+- Cross-validation for prediction accuracy
+
+**Packages required:**
+
+```{r packages}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+```
+
+---
+
+## 1. Data preparation
+
+### The met_example dataset
+
+The `met_example` dataset bundled with `bayesreml` contains a synthetic
+multi-environment trial with 10 genotypes, 4 environments, and 3 replicates.
+It includes pre-computed genomic and pedigree relationship matrices.
+
+```{r data-load}
+data(met_example, package = "bayesreml")
+
+dat   <- met_example$dat
+G_mat <- met_example$G_mat    # 10 x 10 genomic relationship matrix
+A_mat <- met_example$A_mat    # 10 x 10 pedigree relationship matrix
+M     <- met_example$M_geno   # 10 x 50 marker matrix
+
+str(dat)
+dim(G_mat)
+dim(M)
+```
+
+### Genomic relationship matrix: VanRaden Method 1
+
+The VanRaden (2008) Method 1 genomic relationship matrix is:
+
+$$
+\mathbf{G} = \frac{(\mathbf{M} - 2\mathbf{p}\mathbf{1}')
+              (\mathbf{M} - 2\mathbf{p}\mathbf{1}')'}
+             {2 \sum_{k=1}^{m} p_k (1 - p_k)}
+$$
+
+where $\mathbf{M}$ is the $n \times m$ marker matrix (coded 0, 1, 2),
+$p_k$ is the allele frequency at locus $k$, and $m$ is the number of markers.
+
+```{r gmat-construct}
+# Reconstruct G matrix from marker data (for illustration)
+construct_G_vanraden <- function(M) {
+  p <- colMeans(M) / 2               # allele frequencies
+  P <- matrix(2 * p, nrow = nrow(M), ncol = ncol(M), byrow = TRUE)
+  Z <- M - P                         # centred marker matrix
+  denom <- 2 * sum(p * (1 - p))      # scaling factor
+  G <- (Z %*% t(Z)) / denom
+  rownames(G) <- colnames(G) <- rownames(M)
+  return(G)
+}
+
+G_check <- construct_G_vanraden(M)
+
+# Verify it matches the bundled matrix
+cat("Max absolute difference:", max(abs(G_check - G_mat)), "\n")
+```
+
+### Visualise the G matrix
+
+```{r gmat-heatmap, fig.height = 5}
+G_long <- as.data.frame(as.table(G_mat))
+names(G_long) <- c("Geno1", "Geno2", "Relatedness")
+
+ggplot(G_long, aes(x = Geno1, y = Geno2, fill = Relatedness)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  labs(title = "Genomic relationship matrix (VanRaden Method 1)",
+       x = "", y = "") +
+  coord_equal() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Diagonal elements represent the individual's genomic inbreeding coefficient
+(plus 1). Off-diagonal elements represent pairwise relatedness: values close to
+0 indicate unrelated individuals, while values near 0.5 suggest half-sibs.
+
+---
+
+## 2. Model 13a: GBLUP with VanRaden G matrix
+
+### Mathematical formulation
+
+The GBLUP model is:
+
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \mathbf{Z}\mathbf{g}
+             + \boldsymbol{\varepsilon}
+$$
+
+where $\mathbf{g} \sim \mathcal{N}(\mathbf{0}, \sigma_g^2 \mathbf{G})$ and
+$\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \sigma_e^2 \mathbf{I})$.
+
+The key difference from a standard random intercept model is the covariance
+structure: $\text{Var}(\mathbf{g}) = \sigma_g^2 \mathbf{G}$ instead of
+$\sigma_g^2 \mathbf{I}$.
+
+### Fitting
+
+```{r m13a-fit}
+m_13a <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ vm(geno, Gmat),
+  data           = dat,
+  known_matrices = list(Gmat = G_mat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_13a)
+```
+
+The `vm(geno, Gmat)` syntax tells `bayesreml` that the random effect for
+`geno` has covariance proportional to the matrix named `Gmat` in
+`known_matrices`.
+
+### Diagnostics
+
+```{r m13a-diag, fig.height = 6}
+plot(m_13a, type = "diagnostics")
+plot(m_13a, type = "variance")
+```
+
+### Genomic heritability
+
+Genomic heritability is:
+
+$$
+h^2_g = \frac{\sigma_g^2}{\sigma_g^2 + \sigma_e^2}
+$$
+
+We compute the full posterior distribution of $h^2_g$:
+
+```{r m13a-heritability, fig.height = 4}
+draws <- do.call(rbind, lapply(m_13a$greta$draws, as.matrix))
+
+# Identify variance component columns
+vc_cols <- colnames(draws)
+cat("Available parameters:\n")
+print(vc_cols)
+
+# Extract genetic and residual variance draws
+# (exact names depend on bayesreml parameterisation)
+sigma2_g_draws <- draws[, grep("sigma.*geno|sigma.*vm", vc_cols, value = TRUE)]
+sigma2_e_draws <- draws[, grep("sigma_e", vc_cols, value = TRUE)]
+
+# If variance components are on the SD scale, square them
+# (check the parameterisation from extras)
+h2_draws <- sigma2_g_draws^2 / (sigma2_g_draws^2 + sigma2_e_draws^2)
+
+h2_summary <- data.frame(
+  mean   = mean(h2_draws),
+  median = median(h2_draws),
+  q2.5   = quantile(h2_draws, 0.025),
+  q97.5  = quantile(h2_draws, 0.975)
+)
+cat("\nGenomic heritability:\n")
+print(round(h2_summary, 3))
+
+ggplot(data.frame(h2 = h2_draws), aes(x = h2)) +
+  geom_histogram(bins = 50, fill = "forestgreen", colour = "white",
+                 alpha = 0.8) +
+  geom_vline(xintercept = h2_summary$median, linetype = "dashed",
+             colour = "red") +
+  labs(title = expression("Posterior distribution of genomic heritability " * h[g]^2),
+       x = expression(h[g]^2), y = "Count") +
+  theme_minimal()
+```
+
+### GEBVs: caterpillar plot
+
+Genomic Estimated Breeding Values (GEBVs) are the BLUPs of $\mathbf{g}$,
+representing each genotype's predicted genetic merit.
+
+```{r m13a-gebvs, fig.height = 5}
+blups <- m_13a$extras$blups
+
+# Extract genotype BLUPs
+geno_blups <- blups[grep("geno", blups$term), ]
+
+ggplot(geno_blups, aes(x = reorder(level, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = q2.5, ymax = q97.5),
+                  colour = "forestgreen", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_flip() +
+  labs(title = "GEBVs with 95% credible intervals",
+       subtitle = "Model 13a: GBLUP",
+       x = "Genotype", y = "GEBV") +
+  theme_minimal()
+```
+
+---
+
+## 3. Model 13b: Additive genomic BLUP across environments
+
+Extend the GBLUP to include genotype-by-environment interaction:
+
+$$
+y_{ijk} = \mu + E_j + g_i + (gE)_{ij} + \varepsilon_{ijk}
+$$
+
+where $\mathbf{g} \sim \mathcal{N}(\mathbf{0}, \sigma_g^2 \mathbf{G})$
+and $(gE)_{ij}$ captures genotype-specific responses to environments.
+
+```{r m13b-fit}
+m_13b <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ vm(geno, Gmat) + geno:env,
+  data           = dat,
+  known_matrices = list(Gmat = G_mat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_13b)
+```
+
+### Variance partitioning
+
+```{r m13b-varpart}
+vc_b <- m_13b$extras$variance_comps
+print(vc_b)
+
+# Proportions of total variance
+total_var <- sum(vc_b$estimate)
+vc_b$proportion <- round(vc_b$estimate / total_var, 3)
+print(vc_b[, c("component", "estimate", "proportion")])
+```
+
+### GBLUP vs ABLUP comparison
+
+Compare genomic prediction (G matrix) against pedigree-based prediction (A
+matrix):
+
+```{r m13b-vs-ablup}
+m_13b_A <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ vm(geno, Amat) + geno:env,
+  data           = dat,
+  known_matrices = list(Amat = A_mat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+
+anova(m_13b, m_13b_A)
+```
+
+```{r m13b-compare-plot, fig.height = 5}
+# Compare GEBVs from G vs A matrices
+blups_G <- m_13b$extras$blups[grep("geno", m_13b$extras$blups$term), ]
+blups_A <- m_13b_A$extras$blups[grep("geno", m_13b_A$extras$blups$term), ]
+
+compare_df <- merge(
+  blups_G[, c("level", "estimate")],
+  blups_A[, c("level", "estimate")],
+  by = "level", suffixes = c("_GBLUP", "_ABLUP")
+)
+
+ggplot(compare_df, aes(x = estimate_ABLUP, y = estimate_GBLUP)) +
+  geom_point(size = 3, colour = "forestgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50") +
+  geom_text(aes(label = level), hjust = -0.2, size = 3) +
+  labs(title = "GBLUP vs ABLUP breeding values",
+       x = "ABLUP (pedigree)", y = "GBLUP (genomic)") +
+  theme_minimal()
+
+# Correlation
+cat("Correlation GBLUP vs ABLUP:",
+    round(cor(compare_df$estimate_GBLUP, compare_df$estimate_ABLUP), 3), "\n")
+```
+
+---
+
+## 4. Model 13c: Additive + dominance
+
+### Dominance relationship matrix
+
+The dominance relationship matrix $\mathbf{D}$ captures non-additive genetic
+effects. Using the marker matrix $\mathbf{M}$ (coded 0, 1, 2):
+
+$$
+\mathbf{D} = \frac{\mathbf{W}\mathbf{W}'}
+             {\sum_{k=1}^{m} (2 p_k (1-p_k))^2}
+$$
+
+where $W_{ik} = M_{ik}(2 - M_{ik}) - 2p_k(1-p_k)$ captures heterozygosity
+deviations.
+
+```{r dmat-construct}
+construct_D_matrix <- function(M) {
+  p <- colMeans(M) / 2
+  n <- nrow(M)
+  m <- ncol(M)
+
+  W <- matrix(0, n, m)
+  for (k in seq_len(m)) {
+    q_k <- 1 - p[k]
+    W[, k] <- M[, k] * (2 - M[, k]) - 2 * p[k] * q_k
+  }
+
+  denom <- sum((2 * p * (1 - p))^2)
+  D <- (W %*% t(W)) / denom
+  rownames(D) <- colnames(D) <- rownames(M)
+  return(D)
+}
+
+D_mat <- construct_D_matrix(M)
+```
+
+### Fitting
+
+```{r m13c-fit}
+m_13c <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ vm(geno, Gmat) + vm(geno, Dmat),
+  data           = dat,
+  known_matrices = list(Gmat = G_mat, Dmat = D_mat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_13c)
+```
+
+### Additive vs dominance variance
+
+```{r m13c-varpart}
+vc_c <- m_13c$extras$variance_comps
+print(vc_c)
+
+# Broad-sense heritability: H^2 = (sigma_a^2 + sigma_d^2) / sigma_total^2
+sigma2_a <- vc_c$estimate[grep("Gmat", vc_c$component)]
+sigma2_d <- vc_c$estimate[grep("Dmat", vc_c$component)]
+sigma2_e <- vc_c$estimate[vc_c$component == "Residual"]
+
+h2_narrow <- sigma2_a / (sigma2_a + sigma2_d + sigma2_e)
+H2_broad  <- (sigma2_a + sigma2_d) / (sigma2_a + sigma2_d + sigma2_e)
+
+cat("Narrow-sense h2:", round(h2_narrow, 3), "\n")
+cat("Broad-sense  H2:", round(H2_broad, 3), "\n")
+cat("Dominance ratio:", round(sigma2_d / sigma2_a, 3), "\n")
+```
+
+---
+
+## 5. Model 13d: Epistatic (additive x additive)
+
+### Epistatic relationship matrix
+
+The additive-by-additive epistatic relationship matrix is the Hadamard
+(element-wise) product of the G matrix with itself:
+
+$$
+\mathbf{G}_{\text{AA}} = \mathbf{G} \circ \mathbf{G}
+$$
+
+```{r epi-construct}
+G_AA <- G_mat * G_mat   # Hadamard product
+rownames(G_AA) <- colnames(G_AA) <- rownames(G_mat)
+
+# Ensure positive definiteness
+G_AA <- as.matrix(Matrix::nearPD(G_AA)$mat)
+```
+
+### Fitting
+
+```{r m13d-fit}
+m_13d <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ vm(geno, Gmat) + vm(geno, Dmat) + vm(geno, Gaa),
+  data           = dat,
+  known_matrices = list(Gmat = G_mat, Dmat = D_mat, Gaa = G_AA),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_13d)
+```
+
+### Model comparison
+
+```{r m13d-compare}
+anova(m_13a, m_13b, m_13c, m_13d)
+```
+
+---
+
+## 6. Prediction accuracy via cross-validation
+
+Prediction accuracy is the correlation between GEBVs and observed phenotypes
+in a validation set. We use a leave-one-genotype-out cross-validation.
+
+```{r cv-accuracy}
+genos <- levels(dat$geno)
+n_geno <- length(genos)
+
+cv_results <- data.frame(
+  genotype     = genos,
+  observed_mean = numeric(n_geno),
+  predicted     = numeric(n_geno)
+)
+
+for (i in seq_along(genos)) {
+  # Training: all genotypes except i
+  train <- dat[dat$geno != genos[i], ]
+  valid <- dat[dat$geno == genos[i], ]
+
+  # Subset G matrix
+  train_genos <- unique(as.character(train$geno))
+  G_train <- G_mat[train_genos, train_genos]
+
+  fit_cv <- bayesreml(
+    fixed          = yield ~ env,
+    random         = ~ vm(geno, Gmat),
+    data           = train,
+    known_matrices = list(Gmat = G_train),
+    n_samples      = 1000,
+    warmup         = 500,
+    chains         = 2
+  )
+
+  cv_results$observed_mean[i] <- mean(valid$yield)
+
+  # Population-level prediction (no BLUP for unseen genotype)
+  pred <- predict(fit_cv, newdata = valid)
+  cv_results$predicted[i] <- mean(pred)
+}
+
+# Prediction accuracy
+accuracy <- cor(cv_results$observed_mean, cv_results$predicted)
+cat("Cross-validation prediction accuracy:", round(accuracy, 3), "\n")
+```
+
+```{r cv-plot, fig.height = 4}
+ggplot(cv_results, aes(x = observed_mean, y = predicted)) +
+  geom_point(size = 3, colour = "forestgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_text(aes(label = genotype), hjust = -0.2, size = 3) +
+  labs(title = paste0("Leave-one-out prediction accuracy: r = ",
+                      round(accuracy, 3)),
+       x = "Observed mean yield", y = "Predicted yield") +
+  theme_minimal()
+```
+
+---
+
+## 7. Manhattan-style marker effect plot
+
+While GBLUP estimates breeding values rather than individual marker effects,
+we can back-solve for marker effects from the GEBVs:
+
+$$
+\hat{\boldsymbol{\alpha}} = \frac{\mathbf{M}' \mathbf{G}^{-1} \hat{\mathbf{g}}}
+                            {2 \sum p_k(1-p_k)}
+$$
+
+```{r manhattan, fig.height = 4}
+# Back-solve marker effects from GEBVs
+gebvs <- m_13a$extras$blups
+geno_effects <- gebvs$estimate[grep("geno", gebvs$term)]
+names(geno_effects) <- gebvs$level[grep("geno", gebvs$term)]
+
+# Reorder to match G matrix
+geno_effects <- geno_effects[rownames(G_mat)]
+
+p <- colMeans(M) / 2
+P <- matrix(2 * p, nrow = nrow(M), ncol = ncol(M), byrow = TRUE)
+Z <- M - P
+denom <- 2 * sum(p * (1 - p))
+
+G_inv <- solve(G_mat)
+marker_effects <- as.numeric(t(Z) %*% G_inv %*% geno_effects / denom)
+
+marker_df <- data.frame(
+  marker   = seq_along(marker_effects),
+  effect   = marker_effects,
+  abs_effect = abs(marker_effects)
+)
+
+# Threshold: top 10% of effects
+threshold <- quantile(marker_df$abs_effect, 0.90)
+
+ggplot(marker_df, aes(x = marker, y = abs_effect)) +
+  geom_segment(aes(xend = marker, yend = 0), colour = "grey60",
+               linewidth = 0.5) +
+  geom_point(aes(colour = abs_effect > threshold), size = 2) +
+  scale_colour_manual(values = c("FALSE" = "grey40", "TRUE" = "firebrick"),
+                      guide = "none") +
+  geom_hline(yintercept = threshold, linetype = "dashed",
+             colour = "firebrick") +
+  labs(title = "Manhattan-style plot: absolute marker effects",
+       subtitle = "Back-solved from GBLUP breeding values",
+       x = "Marker index", y = "|Marker effect|") +
+  theme_minimal()
+```
+
+---
+
+## 8. Key takeaways
+
+1. **The `vm()` syntax** is the bridge between genomic relationship matrices
+   and the mixed model. It tells `bayesreml` to impose structured covariance
+   on the random effects: $\text{Var}(\mathbf{g}) = \sigma^2 \mathbf{G}$.
+
+2. **VanRaden Method 1** is the standard for constructing genomic relationship
+   matrices from SNP markers. The matrix captures both additive genetic
+   relationships and inbreeding.
+
+3. **Heritability** has a full posterior distribution in the Bayesian framework,
+   rather than a single point estimate. Report the posterior median and 95%
+   credible interval.
+
+4. **Multiple genetic effects** (additive, dominance, epistasis) can be fitted
+   simultaneously by providing separate relationship matrices. The model
+   comparison via DIC helps determine which components are supported by the
+   data.
+
+5. **Cross-validation** is essential for assessing prediction accuracy. The
+   correlation between predicted and observed values in the validation set is
+   the standard metric.
+
+6. **Manhattan plots** from GBLUP use back-solved marker effects and are
+   useful for identifying genomic regions of interest, though individual
+   marker significance is better assessed with explicit GWAS models.
+
+### Inspect the generated code
+
+```{r show-code}
+cat(m_13a$extras$code)
+```
+
+---
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

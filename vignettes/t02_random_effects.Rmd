@@ -1,0 +1,477 @@
+---
+title: "Tutorial 2: Random Effects Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 2: Random Effects Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+This tutorial demonstrates how to fit models with random effects using
+`bayesreml`. You will learn how to:
+
+- Fit random intercept models
+- Fit random slope models
+- Handle crossed and nested random effects
+- Extract and visualise BLUPs (Best Linear Unbiased Predictions)
+- Compute the intraclass correlation coefficient (ICC)
+- Understand shrinkage (BLUPs vs raw means)
+- Use `emmeans` for adjusted means
+- Compare results with `lme4::lmer()`
+
+The primary dataset is `agridat::john.alpha`, an alpha-lattice design
+with 24 genotypes, 3 replicates, and 6 incomplete blocks per replicate.
+
+
+## Mathematical background
+
+### The linear mixed model
+
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \mathbf{Z}\mathbf{u} + \boldsymbol{\varepsilon}
+$$
+
+where:
+
+- $\mathbf{X}\boldsymbol{\beta}$ are the fixed effects
+- $\mathbf{Z}\mathbf{u}$ are the random effects with
+  $\mathbf{u} \sim \mathcal{N}(\mathbf{0},\,\sigma_u^2 \mathbf{I})$
+- $\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0},\,\sigma_e^2 \mathbf{I})$
+
+### Bayesian priors in bayesreml
+
+$$
+\sigma_u^2 \sim \text{Lognormal}(0,\,\sigma_{\text{vc}}^2), \qquad
+\sigma_e^2 \sim \text{Lognormal}(0,\,\sigma_{\text{vc}}^2)
+$$
+
+The BLUPs are the posterior means of $\mathbf{u}$, which enjoy automatic
+shrinkage towards the grand mean --- a key advantage of mixed models.
+
+### Intraclass correlation (ICC)
+
+$$
+\text{ICC} = \frac{\sigma_u^2}{\sigma_u^2 + \sigma_e^2}
+$$
+
+The ICC measures the proportion of total variance attributable to the
+random grouping factor. An ICC close to 1 indicates that most variation
+is between groups; close to 0 indicates most variation is within groups.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(emmeans)
+library(dplyr)
+library(tidyr)
+library(agridat)
+library(lme4)
+```
+
+```{r data}
+data(john.alpha, package = "agridat")
+str(john.alpha)
+# 72 observations: yield, gen (24 levels), rep (3), block (6 per rep)
+```
+
+
+## Model 2a: Random intercept for genotype
+
+Genotype is treated as random because the 24 genotypes are a sample
+from a larger breeding population. Replicate is fixed (it represents
+the experimental structure).
+
+$$
+y_{ij} = \mu + r_j + g_i + \varepsilon_{ij}, \qquad
+g_i \sim \mathcal{N}(0,\,\sigma_g^2)
+$$
+
+```{r m2a-fit}
+m_2a <- bayesreml(
+  fixed     = yield ~ rep,
+  random    = ~ gen,
+  data      = john.alpha,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_2a)
+```
+
+### Variance components and ICC
+
+```{r m2a-vc}
+# Variance components table
+m_2a$extras$variance_comps
+
+# Compute ICC from posterior draws
+all_draws <- do.call(rbind, lapply(m_2a$greta$draws, as.matrix))
+sigma_g_cols <- grep("sigma.*gen", colnames(all_draws), value = TRUE)
+sigma_e_cols <- grep("sigma_e", colnames(all_draws), value = TRUE)
+
+# ICC posterior distribution
+var_g <- all_draws[, sigma_g_cols[1]]^2
+var_e <- all_draws[, sigma_e_cols[1]]^2
+icc_samples <- var_g / (var_g + var_e)
+
+cat("ICC posterior mean:", round(mean(icc_samples), 3), "\n")
+cat("ICC 95% CrI:",
+    round(quantile(icc_samples, 0.025), 3), "-",
+    round(quantile(icc_samples, 0.975), 3), "\n")
+```
+
+**Interpretation:** A high ICC (e.g., > 0.3) indicates substantial
+genotypic variation relative to residual variation, justifying the
+random effect specification. The posterior distribution of the ICC
+provides uncertainty quantification that is not available from
+frequentist methods.
+
+
+### Extracting BLUPs
+
+```{r m2a-blups}
+# BLUPs are stored in $extras$blups
+blups_gen <- m_2a$extras$blups$gen
+print(head(blups_gen))
+
+# Or extract as a data frame
+blup_df <- data.frame(
+  gen  = names(blups_gen),
+  blup = as.numeric(blups_gen)
+)
+blup_df <- blup_df[order(blup_df$blup), ]
+blup_df$gen <- factor(blup_df$gen, levels = blup_df$gen)
+```
+
+
+### Caterpillar plot of BLUPs
+
+```{r m2a-caterpillar, fig.width=7, fig.height=6}
+# Built-in caterpillar plot
+plot(m_2a, type = "blups")
+```
+
+Publication-quality version with ggplot2:
+
+```{r m2a-caterpillar-gg, fig.width=7, fig.height=7}
+ggplot(blup_df, aes(x = blup, y = gen)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(size = 2, colour = "#D55E00") +
+  labs(
+    x     = "Genotype BLUP (deviation from grand mean)",
+    y     = "Genotype",
+    title = "Caterpillar plot: genotype BLUPs"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 8)
+  )
+```
+
+
+### Shrinkage: BLUPs vs raw means
+
+Shrinkage is a defining feature of mixed models. BLUPs are pulled
+("shrunk") towards the grand mean relative to raw (unadjusted) group
+means. Groups with fewer observations or higher uncertainty are shrunk
+more.
+
+```{r m2a-shrinkage, fig.width=6, fig.height=5}
+# Compute raw genotype means
+raw_means <- john.alpha %>%
+  group_by(gen) %>%
+  summarise(raw_mean = mean(yield), .groups = "drop")
+
+# Grand mean from the model
+grand_mean <- coef(m_2a)[["(Intercept)"]]
+
+# Merge with BLUPs
+shrinkage_df <- raw_means %>%
+  mutate(
+    blup_mean = grand_mean + blups_gen[as.character(gen)],
+    raw_dev   = raw_mean - grand_mean,
+    blup_dev  = blups_gen[as.character(gen)]
+  )
+
+ggplot(shrinkage_df, aes(x = raw_dev, y = blup_dev)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey60") +
+  geom_point(size = 2.5, colour = "#0072B2") +
+  labs(
+    x     = "Raw deviation from grand mean",
+    y     = "BLUP deviation from grand mean",
+    title = "Shrinkage: BLUPs vs raw deviations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** Points below the 1:1 line indicate shrinkage. The
+more extreme the raw mean, the more it is pulled towards zero.
+
+
+### Comparison with lme4::lmer()
+
+```{r m2a-lmer}
+lmer_2a <- lmer(yield ~ rep + (1 | gen), data = john.alpha)
+summary(lmer_2a)
+
+# Compare variance components
+cat("bayesreml sigma_g:", m_2a$extras$variance_comps$estimate[1], "\n")
+cat("lmer     sigma_g:", sqrt(VarCorr(lmer_2a)$gen[1, 1]), "\n")
+
+# Compare BLUPs
+lmer_blups <- ranef(lmer_2a)$gen[, 1]
+cor_blups <- cor(blups_gen[names(lmer_blups)], lmer_blups)
+cat("Correlation between BLUPs:", round(cor_blups, 4), "\n")
+```
+
+
+## Model 2b: Random slope
+
+For datasets with a continuous covariate varying within groups, a random
+slope allows the relationship to differ across groups:
+
+$$
+y_{ij} = (\mu + g_{0i}) + (\beta + g_{1i}) x_{ij} + \varepsilon_{ij}
+$$
+
+where $g_{0i}$ is the random intercept and $g_{1i}$ the random slope.
+
+We demonstrate with a synthetic covariate added to `john.alpha`:
+
+```{r m2b-data}
+set.seed(123)
+john.alpha$nitrogen <- rnorm(nrow(john.alpha), mean = 50, sd = 10)
+```
+
+```{r m2b-fit}
+m_2b <- bayesreml(
+  fixed     = yield ~ rep + nitrogen,
+  random    = ~ gen + gen:nitrogen,
+  data      = john.alpha,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_2b)
+```
+
+**Interpretation:** The variance component for `gen:nitrogen` quantifies
+how much the nitrogen response varies across genotypes. If this variance
+is small relative to its CrI width, a simpler random-intercept model
+may suffice.
+
+
+## Model 2c: Crossed random effects (genotype + environment)
+
+Many agricultural experiments have a crossed structure: every genotype
+appears in every environment. In `bayesreml`, specify multiple random
+terms separated by `+`:
+
+$$
+y_{ijk} = \mu + e_j + g_i + (ge)_{ij} + \varepsilon_{ijk}
+$$
+
+$$
+g_i \sim \mathcal{N}(0,\,\sigma_g^2), \quad
+e_j \sim \mathcal{N}(0,\,\sigma_e^2), \quad
+(ge)_{ij} \sim \mathcal{N}(0,\,\sigma_{ge}^2)
+$$
+
+We use `john.alpha` treating `rep` as a proxy for "environment":
+
+```{r m2c-fit}
+m_2c <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen + rep,
+  data      = john.alpha,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_2c)
+```
+
+
+### Variance partitioning
+
+```{r m2c-varpart, fig.width=5, fig.height=4}
+vc <- m_2c$extras$variance_comps
+
+# Compute proportions
+vc$proportion <- vc$estimate / sum(vc$estimate)
+
+ggplot(vc, aes(x = "", y = proportion, fill = component)) +
+  geom_col(width = 1, colour = "white") +
+  coord_polar("y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    fill  = "Component",
+    title = "Variance partitioning"
+  ) +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+
+## Model 2d: Nested random effects (block within replicate)
+
+In an alpha-lattice design, incomplete blocks are nested within
+replicates. This is specified using the colon operator:
+
+$$
+y_{ijk} = \mu + r_j + g_i + b_{k(j)} + \varepsilon_{ijk}
+$$
+
+where $b_{k(j)} \sim \mathcal{N}(0,\,\sigma_b^2)$.
+
+```{r m2d-fit}
+m_2d <- bayesreml(
+  fixed     = yield ~ rep,
+  random    = ~ gen + rep:block,
+  data      = john.alpha,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_2d)
+```
+
+### Compare with lmer
+
+```{r m2d-lmer}
+lmer_2d <- lmer(yield ~ rep + (1 | gen) + (1 | rep:block),
+                data = john.alpha)
+summary(lmer_2d)
+
+# Compare variance components
+cat("\nbayesreml VCs:\n")
+print(m_2d$extras$variance_comps)
+
+cat("\nlmer VCs:\n")
+print(VarCorr(lmer_2d))
+```
+
+**Interpretation:** The nested block effect captures local field
+heterogeneity within each replicate. If $\sigma_b^2$ is substantial
+relative to $\sigma_e^2$, the incomplete blocking was effective at
+reducing residual variation, improving the precision of genotype
+comparisons.
+
+
+### Emmeans: adjusted genotype means
+
+```{r m2d-emmeans}
+# Adjusted means averaged over reps
+emm_2d <- emmeans(m_2d, ~ gen)
+emm_2d
+
+# Pairwise comparisons (top 5 pairs by estimate)
+pairs_2d <- pairs(emm_2d)
+pairs_df <- as.data.frame(pairs_2d)
+pairs_df <- pairs_df[order(abs(pairs_df$estimate), decreasing = TRUE), ]
+head(pairs_df, 10)
+```
+
+
+### Adjusted means plot
+
+```{r m2d-emmeans-plot, fig.width=7, fig.height=6}
+emm_df <- as.data.frame(emm_2d)
+emm_df <- emm_df[order(emm_df$emmean), ]
+emm_df$gen <- factor(emm_df$gen, levels = emm_df$gen)
+
+ggplot(emm_df, aes(x = emmean, y = gen)) +
+  geom_point(size = 2, colour = "#009E73") +
+  geom_errorbarh(aes(xmin = lower.CL, xmax = upper.CL),
+                 height = 0.3, colour = "#009E73") +
+  geom_vline(xintercept = mean(emm_df$emmean), linetype = "dashed",
+             colour = "grey50") +
+  labs(
+    x     = "Adjusted yield mean",
+    y     = "Genotype",
+    title = "Adjusted genotype means (alpha-lattice model)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 7)
+  )
+```
+
+
+## Model comparison
+
+```{r model-compare}
+anova(m_2a, m_2c, m_2d)
+```
+
+**Interpretation:** Adding nested block effects (Model 2d) typically
+improves fit for alpha-lattice designs. Compare DIC values; the model
+with the lowest DIC is preferred.
+
+
+## Diagnostics
+
+```{r diagnostics}
+# Residuals vs fitted
+plot(m_2d, type = "residuals")
+
+# Variance components with CrI
+plot(m_2d, type = "variance")
+
+# Posterior predictive check
+plot(m_2d, type = "pp_check")
+```
+
+
+## Tips for random effects models
+
+1. **Factor coding:** Ensure random-effect variables are factors in your
+   data frame before calling `bayesreml()`.
+
+2. **Prior sensitivity:** For models with few levels of a random factor
+   (e.g., 3 replicates), the prior on $\sigma_u$ can be influential.
+   Try `prior_vc_sd = 0.5` (more informative) vs `prior_vc_sd = 2`
+   (less informative) to assess sensitivity.
+
+3. **Convergence:** Random effects models have more parameters. Check
+   Rhat < 1.05 and ESS > 400 for all parameters. If convergence is
+   poor, increase `warmup` and `n_samples`.
+
+4. **Number of levels:** Random effects are most useful when there are
+   many levels (> 5--10). With very few levels, estimation of the
+   variance component is unstable.
+
+5. **BLUPs vs BLUEs:** In `bayesreml`, fixed effects are estimated
+   (BLUEs) and random effects are predicted (BLUPs). The `emmeans()`
+   function computes marginal means based on fixed effects; BLUPs are
+   available separately via `$extras$blups`.
+
+
+## Summary
+
+| Model  | Fixed          | Random           | Description              |
+|--------|----------------|------------------|--------------------------|
+| `m_2a` | `yield ~ rep`  | `~ gen`          | Random genotype intercept|
+| `m_2b` | `yield ~ rep + nitrogen` | `~ gen + gen:nitrogen` | Random slope |
+| `m_2c` | `yield ~ 1`    | `~ gen + rep`    | Crossed random effects   |
+| `m_2d` | `yield ~ rep`  | `~ gen + rep:block` | Nested blocks         |
+
+The next tutorial covers **structured covariance models** (us, fa,
+compound symmetry) for modelling correlations among random effects.

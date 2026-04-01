@@ -1,0 +1,443 @@
+---
+title: "Tutorial 17: Additional ASReml-Specific Features"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 17: Additional ASReml-Specific Features}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+This tutorial covers advanced ASReml-specific model structures that
+`bayesreml` translates into greta code. These features --- correlation
+structures and factor-analytic (FA) models --- are hallmarks of the
+ASReml modelling framework. You will learn how to:
+
+- Specify spatial correlation structures (AR1)
+- Fit factor-analytic (FA) models for genotype-by-environment interaction
+- Constrain specific variance parameters (psi) in FA models
+- Inspect the generated greta code to understand the translation
+- Produce scree plots and biplots
+
+We use `agridat::yan.winterwheat` for FA models and
+`agridat::kempton.barley.uniform` for spatial correlation structures.
+
+## Mathematical background
+
+### Factor-analytic (FA) models
+
+The FA model decomposes the $t \times t$ genotype-by-environment
+variance-covariance matrix $\mathbf{G}$ as:
+
+$$
+\mathbf{G} = \boldsymbol{\Lambda}\boldsymbol{\Lambda}^\top + \boldsymbol{\Psi}
+$$
+
+where $\boldsymbol{\Lambda}$ is a $t \times k$ matrix of factor loadings
+($k$ factors), and $\boldsymbol{\Psi} = \text{diag}(\psi_1, \ldots,
+\psi_t)$ is a diagonal matrix of specific variances. The number of
+parameters is $tk + t$ (loadings plus specific variances) versus
+$t(t+1)/2$ for an unstructured matrix, yielding substantial parsimony
+when $k \ll t$.
+
+### Spatial correlation structures
+
+In field trials, residuals from neighbouring plots are often correlated.
+The separable AR1 $\times$ AR1 structure models this as:
+
+$$
+\mathbf{R} = \sigma_e^2 \left(\mathbf{R}_{\text{row}}(\rho_r) \otimes
+\mathbf{R}_{\text{col}}(\rho_c)\right)
+$$
+
+where $\mathbf{R}_{\text{row}}$ and $\mathbf{R}_{\text{col}}$ are
+first-order autoregressive correlation matrices with parameters $\rho_r$
+and $\rho_c$ respectively.
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(agridat)
+library(patchwork)
+```
+
+
+## Part A: Correlation structures
+
+### Data: Kempton barley uniform trial
+
+```{r data-kempton}
+data(kempton.barley.uniform, package = "agridat")
+barley <- kempton.barley.uniform
+
+str(barley)
+# Variables: gen, rep, row, col, yield
+# A uniformity trial with known spatial structure
+```
+
+```{r barley-explore, fig.width=7, fig.height=5}
+ggplot(barley, aes(x = col, y = row, fill = yield)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(
+    title = "Kempton barley: spatial yield map",
+    x = "Column", y = "Row", fill = "Yield"
+  ) +
+  coord_fixed() +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+### Model 17a: Separable AR1 x AR1 residual correlation
+
+In ASReml syntax, separable residual correlation is specified via the
+`rcov` argument. `bayesreml` translates this into an appropriate greta
+structure:
+
+```{r m17a-fit}
+m_17a <- bayesreml(
+  fixed   = yield ~ gen,
+  random  = ~ rep,
+  rcov    = ~ ar1(row):ar1(col),
+  data    = barley,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_17a)
+```
+
+```{r m17a-correlation}
+# Extract estimated autocorrelation parameters
+rho_row <- m_17a$extras$vcov_params$ar1_row
+rho_col <- m_17a$extras$vcov_params$ar1_col
+
+cat("Row autocorrelation (rho_r):", round(rho_row, 3), "\n")
+cat("Col autocorrelation (rho_c):", round(rho_col, 3), "\n")
+```
+
+```{r m17a-compare}
+# Compare with independent residuals
+m_17a_iid <- bayesreml(
+  fixed   = yield ~ gen,
+  random  = ~ rep,
+  data    = barley,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+anova(m_17a_iid, m_17a)
+```
+
+**Interpretation:** If $\hat{\rho}_r$ and $\hat{\rho}_c$ are substantially
+greater than zero (e.g., > 0.3), the spatial correlation structure is
+warranted. The DIC comparison quantifies the improvement in fit.
+
+
+### Visualising spatial residual correlation
+
+```{r m17a-residual-map, fig.width=7, fig.height=5}
+barley$resid_iid <- residuals(m_17a_iid)
+barley$resid_ar1 <- residuals(m_17a)
+
+p1 <- ggplot(barley, aes(x = col, y = row, fill = resid_iid)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0) +
+  labs(title = "Residuals: IID model", fill = "Residual") +
+  coord_fixed() +
+  theme_minimal(base_size = 11)
+
+p2 <- ggplot(barley, aes(x = col, y = row, fill = resid_ar1)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0) +
+  labs(title = "Residuals: AR1 x AR1 model", fill = "Residual") +
+  coord_fixed() +
+  theme_minimal(base_size = 11)
+
+p1 + p2 +
+  plot_annotation(
+    title = "Spatial residual patterns: IID vs AR1 x AR1",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+```
+
+
+## Part B: Factor-analytic models
+
+### Data: Yan winter wheat
+
+```{r data-yan}
+data(yan.winterwheat, package = "agridat")
+wheat <- yan.winterwheat
+
+str(wheat)
+# Variables: gen, env, yield
+# Multi-environment trial with genotypes across environments
+
+# Number of environments and genotypes
+n_env <- length(unique(wheat$env))
+n_gen <- length(unique(wheat$gen))
+cat("Environments:", n_env, "\n")
+cat("Genotypes:", n_gen, "\n")
+```
+
+
+### Model 17b: Factor-analytic with constrained and unconstrained psi
+
+```{r m17b-unconstrained}
+# FA with k = 2, unconstrained specific variances
+m_17b_free <- bayesreml(
+  fixed   = yield ~ env,
+  random  = ~ fa(gen, k = 2):env,
+  data    = wheat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_17b_free)
+```
+
+```{r m17b-constrained}
+# FA with k = 2, constrained psi (equal specific variances)
+m_17b_equal <- bayesreml(
+  fixed   = yield ~ env,
+  random  = ~ fa(gen, k = 2, psi = "equal"):env,
+  data    = wheat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_17b_equal)
+```
+
+```{r m17b-compare}
+# Compare constrained vs unconstrained
+anova(m_17b_equal, m_17b_free)
+```
+
+```{r m17b-psi, fig.width=6, fig.height=4}
+# Compare specific variances
+psi_free <- m_17b_free$extras$fa_psi
+psi_equal <- m_17b_equal$extras$fa_psi
+
+psi_df <- data.frame(
+  environment = names(psi_free),
+  free        = psi_free,
+  equal       = psi_equal
+)
+
+ggplot(psi_df, aes(x = reorder(environment, free))) +
+  geom_point(aes(y = free, colour = "Unconstrained"), size = 3) +
+  geom_point(aes(y = equal, colour = "Equal (constrained)"), size = 3,
+             shape = 17) +
+  geom_hline(yintercept = psi_equal[1], linetype = "dashed",
+             colour = "grey50") +
+  scale_colour_manual(values = c("Unconstrained" = "#0072B2",
+                                  "Equal (constrained)" = "#D55E00"),
+                      name = NULL) +
+  labs(
+    x = "Environment",
+    y = expression(psi[j] ~ "(specific variance)"),
+    title = "Specific variances: constrained vs unconstrained FA(2)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+**Interpretation:** If the environment-specific variances
+($\psi_j$) are approximately equal, the constrained model is adequate
+and more parsimonious. Large variation in $\psi_j$ across environments
+favours the unconstrained model.
+
+
+### Scree plot: choosing the number of factors
+
+```{r scree, fig.width=6, fig.height=4}
+# Fit FA models with k = 1, 2, 3 factors and extract variance explained
+dic_values <- numeric(3)
+var_explained <- numeric(3)
+
+for (k in 1:3) {
+  fit_k <- bayesreml(
+    fixed   = yield ~ env,
+    random  = ~ fa(gen, k = k):env,
+    data    = wheat,
+    n_samples = 1500,
+    warmup    = 750,
+    chains    = 2
+  )
+  dic_values[k] <- fit_k$extras$DIC
+
+  # Proportion of variance from loadings vs total
+  Lambda_k <- fit_k$extras$fa_loadings
+  G_k <- Lambda_k %*% t(Lambda_k) + diag(fit_k$extras$fa_psi)
+  eig_k <- eigen(G_k)$values
+  var_explained[k] <- sum(eigen(Lambda_k %*% t(Lambda_k))$values) /
+                      sum(eig_k)
+}
+
+scree_df <- data.frame(
+  k = 1:3,
+  DIC = dic_values,
+  var_explained = var_explained * 100
+)
+
+p_scree1 <- ggplot(scree_df, aes(x = k, y = DIC)) +
+  geom_line(linewidth = 0.8, colour = "#0072B2") +
+  geom_point(size = 3, colour = "#0072B2") +
+  scale_x_continuous(breaks = 1:3) +
+  labs(x = "Number of factors (k)", y = "DIC",
+       title = "Model fit") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_scree2 <- ggplot(scree_df, aes(x = k, y = var_explained)) +
+  geom_line(linewidth = 0.8, colour = "#D55E00") +
+  geom_point(size = 3, colour = "#D55E00") +
+  scale_x_continuous(breaks = 1:3) +
+  labs(x = "Number of factors (k)", y = "Variance explained (%)",
+       title = "Variance captured by loadings") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_scree1 + p_scree2 +
+  plot_annotation(
+    title = "Scree analysis: selecting the number of FA factors",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+```
+
+**Interpretation:** Look for an "elbow" in both plots. If FA(2) captures
+> 90% of variance and FA(3) adds little improvement, $k = 2$ is
+sufficient.
+
+
+### FA biplot
+
+```{r biplot, fig.width=7, fig.height=6}
+# Extract loadings from FA(2)
+Lambda <- m_17b_free$extras$fa_loadings
+
+# Environment loadings (rows of Lambda)
+env_loadings <- as.data.frame(Lambda)
+colnames(env_loadings) <- c("Factor1", "Factor2")
+env_loadings$env <- rownames(env_loadings)
+env_loadings$type <- "Environment"
+
+# Genotype scores (BLUPs projected onto factor space)
+gen_scores <- m_17b_free$extras$fa_scores
+gen_scores_df <- as.data.frame(gen_scores)
+colnames(gen_scores_df) <- c("Factor1", "Factor2")
+gen_scores_df$gen <- rownames(gen_scores_df)
+gen_scores_df$type <- "Genotype"
+
+ggplot() +
+  # Environment arrows
+  geom_segment(data = env_loadings,
+               aes(x = 0, y = 0, xend = Factor1, yend = Factor2),
+               arrow = arrow(length = unit(0.2, "cm")),
+               colour = "#D55E00", linewidth = 0.7) +
+  geom_text(data = env_loadings,
+            aes(x = Factor1 * 1.1, y = Factor2 * 1.1, label = env),
+            colour = "#D55E00", size = 3.5, fontface = "bold") +
+  # Genotype points
+
+  geom_point(data = gen_scores_df,
+             aes(x = Factor1, y = Factor2),
+             colour = "#0072B2", size = 2.5) +
+  geom_text(data = gen_scores_df,
+            aes(x = Factor1, y = Factor2, label = gen),
+            colour = "#0072B2", size = 3, nudge_y = 0.05) +
+  # Origin lines
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+  labs(
+    x = "Factor 1",
+    y = "Factor 2",
+    title = "FA(2) biplot: genotypes and environments",
+    subtitle = "Arrows = environment loadings; points = genotype scores"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation:** In the biplot, environments pointing in similar
+directions are positively correlated for genotype performance. Genotypes
+that project far along an environment's arrow perform well in that
+environment. Genotypes near the origin are average across all environments.
+
+
+## Inspecting generated greta code
+
+A key diagnostic is examining the translated greta code. This is
+especially important for complex structures where the translation is
+non-trivial:
+
+```{r code-walkthrough}
+# FA model code
+cat("=== FA(2) model ===\n")
+cat(m_17b_free$extras$code)
+```
+
+The generated code typically includes:
+
+1. **Loading matrix construction** --- a lower-triangular $t \times k$
+   matrix with free parameters below the diagonal and constrained
+   elements above.
+2. **Specific variance parameters** --- $\psi_j$ as log-normal random
+   variables (unconstrained) or a single shared parameter (constrained).
+3. **Covariance matrix assembly** --- `G <- Lambda %*% t(Lambda) +
+   diag(psi)`.
+4. **Random effect distribution** --- genotype effects drawn from
+   `greta::multivariate_normal(zeros, G)`.
+
+```{r code-ar1}
+# AR1 x AR1 residual code
+cat("=== AR1 x AR1 model ===\n")
+cat(m_17a$extras$code)
+```
+
+The AR1 $\times$ AR1 code constructs the Kronecker product of two
+correlation matrices, each parameterised by a single $\rho$ on $(0, 1)$.
+
+
+## Summary
+
+| Model | Specification | Feature | Key output |
+|-------|--------------|---------|------------|
+| `m_17a` | `rcov = ~ ar1(row):ar1(col)` | Separable spatial correlation | $\rho_r$, $\rho_c$ |
+| `m_17b` | `random = ~ fa(gen, k=2):env` | Factor-analytic (free/equal $\psi$) | Loadings, $\psi_j$, biplot |
+
+Key takeaways:
+
+1. ASReml's correlation structures (AR1, AR1 $\times$ AR1) are
+   translated to explicit covariance matrix constructions in greta.
+2. FA models provide parsimonious summaries of G x E interaction; the
+   scree plot guides factor selection.
+3. Constrained vs unconstrained specific variances ($\psi$) trade
+   parsimony against flexibility --- use DIC to decide.
+4. The `cat(fit$extras$code)` workflow is invaluable for understanding
+   and verifying the translation from ASReml syntax to greta code.
+5. Biplots from FA models are a powerful tool for visualising genotype
+   stability and environment similarity.

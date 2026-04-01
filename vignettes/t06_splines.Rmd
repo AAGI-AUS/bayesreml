@@ -1,0 +1,498 @@
+---
+title: "Tutorial 6: Spline Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 6: Spline Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Non-linear relationships are ubiquitous in biological data: growth curves,
+dose-response functions, temporal trends, and spatial gradients all require
+flexible curve-fitting. Spline models achieve this flexibility by constructing
+a smooth function from piecewise polynomial basis functions, while controlling
+wiggliness through a penalty (or, in the Bayesian setting, a prior on the
+smoothing parameter).
+
+This tutorial demonstrates three spline formulations in `bayesreml`:
+
+| Model | Description | `bayesreml` syntax |
+|-------|------------|-------------------|
+| m_6a  | Cubic smoothing spline | `random = ~ spl(Time)` |
+| m_6b  | Random B-spline with explicit knots | `random = ~ spl(Time, type = "bs", df = 10)` |
+| m_6c  | P-spline (penalised B-spline) | `random = ~ spl(Time, type = "ps", df = 20)` |
+
+**Dataset.** We use `nlme::Soybean`, which records leaf weight over time for
+48 soybean plots across three genotypes and two planting years.
+
+**Prerequisites.** Install the following packages if not already available:
+
+```{r prereqs}
+library(bayesreml)
+library(nlme)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(mgcv)
+library(splines)
+```
+
+
+## 1. Data Preparation
+
+```{r data-prep}
+data(Soybean, package = "nlme")
+
+soy <- Soybean %>%
+  mutate(
+    Plot    = factor(Plot),
+    Variety = factor(Variety),
+    Year    = factor(Year),
+    Time_sc = (Time - mean(Time)) / sd(Time)   # centred for numerics
+  )
+
+str(soy)
+head(soy)
+```
+
+The response is `weight` (dry leaf weight in grams), measured at irregular
+time points between day 14 and day 84. There are three soybean varieties
+(Forrest, Plan Introduction 416937, and Plan Introduction 307861) observed
+across two years.
+
+
+## 2. Exploratory Spaghetti Plot
+
+A spaghetti plot shows each plot's trajectory to reveal non-linearity and
+between-plot variability.
+
+```{r spaghetti}
+ggplot(soy, aes(x = Time, y = weight, group = Plot, colour = Variety)) +
+  geom_line(alpha = 0.5) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  facet_wrap(~ Year) +
+  labs(
+    title    = "Soybean growth curves by variety and year",
+    x        = "Time (days after planting)",
+    y        = "Leaf weight (g)",
+    colour   = "Variety"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The growth curves are clearly sigmoidal. A linear model would be a poor
+approximation; we need flexible smooth functions.
+
+
+## 3. Mathematical Background
+
+### 3.1 Cubic Smoothing Spline as a Mixed Model
+
+A cubic smoothing spline for a scalar covariate $x$ can be written as a
+mixed model (Wand 2003; Ruppert et al. 2003):
+
+$$
+y_i = \beta_0 + \beta_1 x_i + \sum_{k=1}^{K} u_k \, z_{ik} + \varepsilon_i
+$$
+
+where:
+
+- $\beta_0 + \beta_1 x_i$ is the fixed linear trend,
+- $z_{ik} = |x_i - \kappa_k|^3$ are the radial basis functions evaluated at
+  knot locations $\kappa_1, \ldots, \kappa_K$,
+- $u_k \sim N(0, \sigma_u^2)$ are the random spline coefficients,
+- $\varepsilon_i \sim N(0, \sigma^2)$.
+
+The ratio $\lambda = \sigma^2 / \sigma_u^2$ is the smoothing parameter.
+A Bayesian approach places priors on both $\sigma^2$ and $\sigma_u^2$,
+automatically integrating over uncertainty in $\lambda$.
+
+### 3.2 B-spline Basis
+
+A B-spline of degree $d$ with $K$ interior knots produces $K + d + 1$
+basis functions. The `spl(x, type = "bs", df = m)` call in `bayesreml`
+constructs a B-spline design matrix $\mathbf{Z}$ of rank $m$ and treats
+the coefficients as random:
+
+$$
+f(x_i) = \sum_{j=1}^{m} u_j \, B_j(x_i), \qquad u_j \sim N(0, \sigma_u^2)
+$$
+
+### 3.3 P-spline (Penalised B-spline)
+
+P-splines (Eilers & Marx 1996) use a rich B-spline basis ($K$ large) with a
+discrete difference penalty of order $d$:
+
+$$
+\text{penalty} = \sigma_u^{-2} \sum_{k=d+1}^{K} (\Delta^d u_k)^2
+= \sigma_u^{-2} \, \mathbf{u}^\top \mathbf{P} \mathbf{u}
+$$
+
+where $\mathbf{P} = \mathbf{D}_d^\top \mathbf{D}_d$ and $\mathbf{D}_d$ is
+the $d$-th order difference matrix. This is equivalent to a multivariate
+normal prior $\mathbf{u} \sim N(\mathbf{0}, \sigma_u^2 \mathbf{P}^{-})$.
+
+
+## 4. Model 6a: Cubic Smoothing Spline
+
+The simplest spline call. The `spl()` function in the `random` formula
+generates the basis and treats coefficients as random effects.
+
+```{r m6a-fit}
+m_6a <- bayesreml(
+  fixed     = weight ~ Variety + Year + Time,
+  random    = ~ spl(Time),
+  data      = soy,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_6a)
+```
+
+### Inspect Generated Code
+
+```{r m6a-code}
+cat(m_6a$extras$code)
+```
+
+### Trace and Density Diagnostics
+
+```{r m6a-diag}
+mcmc_trace(m_6a$greta$draws, regex_pars = "sigma")
+mcmc_dens_overlay(m_6a$greta$draws, regex_pars = "sigma")
+```
+
+### Fitted Spline with Credible Band
+
+To obtain the posterior fitted curve and its pointwise 95 % credible
+interval, we extract posterior predictions.
+
+```{r m6a-fitted}
+# Create a prediction grid
+pred_grid <- expand.grid(
+  Time    = seq(14, 84, length.out = 200),
+  Variety = levels(soy$Variety)[1],
+  Year    = levels(soy$Year)[1]
+)
+
+# Posterior predictions via greta::calculate()
+preds_6a <- predict(m_6a, newdata = pred_grid, interval = "credible")
+
+pred_df <- cbind(pred_grid, preds_6a)
+
+ggplot() +
+  geom_point(data = soy, aes(x = Time, y = weight), alpha = 0.2, size = 0.8) +
+  geom_ribbon(data = pred_df, aes(x = Time, ymin = lower, ymax = upper),
+              fill = "steelblue", alpha = 0.3) +
+  geom_line(data = pred_df, aes(x = Time, y = fit), colour = "steelblue",
+            linewidth = 1) +
+  labs(
+    title    = "Cubic smoothing spline (m_6a): fitted curve with 95% CrI",
+    x        = "Time (days)", y = "Leaf weight (g)"
+  ) +
+  theme_minimal()
+```
+
+
+## 5. Model 6b: Random B-spline
+
+Specifying `type = "bs"` uses a B-spline basis. The `df` argument controls the
+number of basis functions (and hence the number of random coefficients).
+
+```{r m6b-fit}
+m_6b <- bayesreml(
+  fixed     = weight ~ Variety + Year,
+  random    = ~ spl(Time, type = "bs", df = 10),
+  data      = soy,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_6b)
+```
+
+### Knot Sensitivity Analysis
+
+A key modelling choice is the number and placement of knots. We fit several
+models with different `df` values and compare via WAIC.
+
+```{r knot-sensitivity}
+df_values <- c(5, 8, 10, 15, 20)
+
+fits_knots <- lapply(df_values, function(d) {
+  bayesreml(
+    fixed     = weight ~ Variety + Year,
+    random    = ~ spl(Time, type = "bs", df = d),
+    data      = soy,
+    n_samples = 1000,
+    warmup    = 500,
+    chains    = 2
+  )
+})
+
+# Collect WAIC values
+waic_df <- data.frame(
+  df   = df_values,
+  WAIC = sapply(fits_knots, function(f) f$extras$waic$waic),
+  SE   = sapply(fits_knots, function(f) f$extras$waic$se)
+)
+
+ggplot(waic_df, aes(x = df, y = WAIC)) +
+  geom_pointrange(aes(ymin = WAIC - SE, ymax = WAIC + SE)) +
+  geom_line(linetype = "dashed") +
+  labs(
+    title = "WAIC across B-spline degrees of freedom",
+    x     = "Basis dimension (df)",
+    y     = "WAIC"
+  ) +
+  theme_minimal()
+```
+
+In practice, results are often insensitive to `df` above a moderate threshold
+because the random effects penalty (prior on $\sigma_u^2$) adaptively
+regularises the fit.
+
+
+## 6. Model 6c: P-spline
+
+P-splines use a rich basis with a difference penalty. This is often the
+recommended default for smooth function estimation.
+
+```{r m6c-fit}
+m_6c <- bayesreml(
+  fixed     = weight ~ Variety + Year,
+  random    = ~ spl(Time, type = "ps", df = 20),
+  data      = soy,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_6c)
+```
+
+
+## 7. Derivative: Growth Rate Estimation
+
+The instantaneous growth rate is the first derivative $f'(t)$ of the fitted
+spline. We can estimate this by finite differencing posterior predictions.
+
+```{r derivative}
+h  <- 0.5   # step size in days
+t_seq <- seq(15, 83, by = 1)
+
+grid_lo <- data.frame(Time = t_seq - h/2,
+                      Variety = levels(soy$Variety)[1],
+                      Year = levels(soy$Year)[1])
+grid_hi <- data.frame(Time = t_seq + h/2,
+                      Variety = levels(soy$Variety)[1],
+                      Year = levels(soy$Year)[1])
+
+pred_lo <- predict(m_6c, newdata = grid_lo, interval = "credible")
+pred_hi <- predict(m_6c, newdata = grid_hi, interval = "credible")
+
+deriv_df <- data.frame(
+  Time      = t_seq,
+  rate      = (pred_hi$fit   - pred_lo$fit)   / h,
+  rate_lo   = (pred_hi$lower - pred_lo$lower) / h,
+  rate_hi   = (pred_hi$upper - pred_lo$upper) / h
+)
+
+ggplot(deriv_df, aes(x = Time)) +
+  geom_ribbon(aes(ymin = rate_lo, ymax = rate_hi),
+              fill = "darkorange", alpha = 0.3) +
+  geom_line(aes(y = rate), colour = "darkorange", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Estimated growth rate (first derivative of P-spline)",
+    x     = "Time (days after planting)",
+    y     = "Growth rate (g / day)"
+  ) +
+  theme_minimal()
+```
+
+The peak growth rate identifies the inflection point of the sigmoidal curve,
+an important biological parameter for crop physiology.
+
+
+## 8. Group-Specific Splines
+
+To allow each variety its own smooth trajectory, we interact the spline
+term with the variety factor.
+
+```{r group-splines}
+m_6c_var <- bayesreml(
+  fixed     = weight ~ Variety + Year,
+  random    = ~ at(Variety):spl(Time, type = "ps", df = 20),
+  data      = soy,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# Predictions for each variety
+pred_all <- lapply(levels(soy$Variety), function(v) {
+  nd <- data.frame(
+    Time    = seq(14, 84, length.out = 200),
+    Variety = v,
+    Year    = levels(soy$Year)[1]
+  )
+  p <- predict(m_6c_var, newdata = nd, interval = "credible")
+  cbind(nd, p)
+})
+
+pred_all_df <- bind_rows(pred_all)
+
+ggplot(pred_all_df, aes(x = Time, colour = Variety, fill = Variety)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+  geom_line(aes(y = fit), linewidth = 1) +
+  geom_point(data = soy, aes(x = Time, y = weight, colour = Variety),
+             alpha = 0.2, size = 0.5) +
+  labs(
+    title = "Variety-specific P-spline growth curves with 95% CrI",
+    x     = "Time (days after planting)",
+    y     = "Leaf weight (g)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+## 9. Observed vs Fitted
+
+A useful diagnostic is an observed-vs-fitted plot with a 1:1 line.
+
+```{r obs-vs-fit}
+fitted_vals <- fitted(m_6c)
+resid_vals  <- residuals(m_6c)
+
+diag_df <- data.frame(
+  observed = soy$weight,
+  fitted   = fitted_vals,
+  residual = resid_vals
+)
+
+p1 <- ggplot(diag_df, aes(x = fitted, y = observed)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  labs(title = "Observed vs Fitted", x = "Fitted", y = "Observed") +
+  theme_minimal()
+
+p2 <- ggplot(diag_df, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted", y = "Residual") +
+  theme_minimal()
+
+library(patchwork)
+p1 + p2
+```
+
+
+## 10. Comparison with mgcv::gam()
+
+We compare the P-spline estimate with the frequentist GAM from `mgcv`.
+
+```{r gam-compare}
+gam_fit <- gam(weight ~ Variety + Year + s(Time, bs = "ps", k = 20),
+               data = soy, method = "REML")
+
+# Predictions from both
+nd <- data.frame(Time = seq(14, 84, length.out = 200),
+                 Variety = levels(soy$Variety)[1],
+                 Year = levels(soy$Year)[1])
+
+gam_pred <- predict(gam_fit, newdata = nd, se.fit = TRUE)
+br_pred  <- predict(m_6c, newdata = nd, interval = "credible")
+
+comp_df <- data.frame(
+  Time      = nd$Time,
+  gam_fit   = gam_pred$fit,
+  gam_lo    = gam_pred$fit - 1.96 * gam_pred$se.fit,
+  gam_hi    = gam_pred$fit + 1.96 * gam_pred$se.fit,
+  br_fit    = br_pred$fit,
+  br_lo     = br_pred$lower,
+  br_hi     = br_pred$upper
+)
+
+ggplot(comp_df, aes(x = Time)) +
+  geom_ribbon(aes(ymin = gam_lo, ymax = gam_hi), fill = "grey70", alpha = 0.4) +
+  geom_line(aes(y = gam_fit), colour = "grey40", linewidth = 1) +
+  geom_ribbon(aes(ymin = br_lo, ymax = br_hi), fill = "steelblue", alpha = 0.3) +
+  geom_line(aes(y = br_fit), colour = "steelblue", linewidth = 1) +
+  labs(
+    title    = "bayesreml P-spline (blue) vs mgcv::gam (grey)",
+    subtitle = "Shaded regions are 95% intervals (credible / confidence)",
+    x = "Time (days)", y = "Leaf weight (g)"
+  ) +
+  theme_minimal()
+```
+
+The two approaches typically yield very similar point estimates. The Bayesian
+credible intervals are often slightly wider, correctly reflecting prior
+uncertainty about the smoothing parameter.
+
+
+## 11. Variance Components
+
+The variance components table shows the estimated smoothing variance
+$\sigma_u^2$ alongside the residual variance $\sigma^2$.
+
+```{r vc-table}
+m_6c$extras$variance_comps
+```
+
+The effective degrees of freedom consumed by the spline can be approximated
+from the posterior mean of $\sigma_u^2 / (\sigma_u^2 + \sigma^2)$.
+
+
+## 12. Summary
+
+| Model | Formula | Key feature |
+|-------|---------|------------|
+| m_6a  | `random = ~ spl(Time)` | Cubic smoothing spline via radial basis |
+| m_6b  | `random = ~ spl(Time, type = "bs", df = 10)` | B-spline, explicit control of df |
+| m_6c  | `random = ~ spl(Time, type = "ps", df = 20)` | P-spline, difference penalty |
+| m_6c_var | `random = ~ at(Variety):spl(Time, ...)` | Variety-specific smooth curves |
+
+**Key take-aways:**
+
+1. Splines can be expressed as random effects in a mixed model, making them
+   natural to fit in `bayesreml`.
+2. The Bayesian framework automatically estimates the smoothing parameter
+   by placing priors on $\sigma_u^2$.
+3. P-splines with a rich basis are robust to knot placement because the
+   penalty controls smoothness.
+4. First-derivative estimation from posterior samples provides uncertainty
+   quantification for rates of change.
+5. Group-specific splines via `at(factor):spl(x)` allow flexible non-linear
+   trajectories per treatment level.
+
+
+## References
+
+- Eilers, P. H. C. & Marx, B. D. (1996). Flexible smoothing with B-splines
+  and penalties. *Statistical Science*, 11(2), 89--121.
+- Ruppert, D., Wand, M. P. & Carroll, R. J. (2003). *Semiparametric
+  Regression*. Cambridge University Press.
+- Wand, M. P. (2003). Smoothing and mixed models. *Computational Statistics*,
+  18, 223--249.
+- Wood, S. N. (2017). *Generalized Additive Models: An Introduction with R*
+  (2nd ed.). Chapman & Hall / CRC.

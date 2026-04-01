@@ -1,0 +1,420 @@
+---
+title: "Tutorial 1: Baseline Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 1: Baseline Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+This tutorial introduces `bayesreml` through a sequence of progressively
+complex baseline models using fixed effects only. You will learn how to:
+
+- Fit an intercept-only (null) model
+- Add a categorical fixed effect
+- Add a continuous covariate
+- Compare models with `anova()`
+- Obtain estimated marginal means with `emmeans`
+- Produce publication-quality figures with `ggplot2`
+- Validate results against `stats::lm()`
+
+We use two datasets: `datasets::PlantGrowth` (30 observations, 3 treatment
+groups) and `agridat::fisher.barley` (a classic agricultural trial).
+
+## Mathematical background
+
+All three models are special cases of the general linear model
+
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \boldsymbol{\varepsilon}, \qquad
+\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0},\,\sigma_e^2 \mathbf{I})
+$$
+
+where $\mathbf{X}$ is the design matrix for fixed effects and
+$\boldsymbol{\beta}$ is the vector of fixed-effect coefficients.
+
+Under the Bayesian formulation used by `bayesreml`:
+
+$$
+\beta_j \sim \mathcal{N}(0,\,\sigma_\beta^2), \qquad
+\sigma_e^2 \sim \text{Lognormal}(0,\,\sigma_{\text{vc}}^2)
+$$
+
+where $\sigma_\beta$ is controlled by `prior_fixed_sd` (default 10) and
+$\sigma_{\text{vc}}$ by `prior_vc_sd` (default 1).
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(emmeans)
+library(dplyr)
+library(agridat)
+```
+
+
+## Part A: PlantGrowth dataset
+
+```{r data-plantgrowth}
+data(PlantGrowth)
+str(PlantGrowth)
+# 30 observations, response = weight, factor = group (ctrl, trt1, trt2)
+```
+
+### Model 1a: Intercept-only (null model)
+
+The simplest possible model estimates a single grand mean:
+
+$$
+y_i = \mu + \varepsilon_i
+$$
+
+```{r m1a-fit}
+m_1a <- bayesreml(
+  fixed     = weight ~ 1,
+  data      = PlantGrowth,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+```
+
+Inspect the fit:
+
+```{r m1a-summary}
+# Print overview
+m_1a
+
+# Detailed summary with fixed effects and variance components
+summary(m_1a)
+
+# Extract the grand mean (posterior mean)
+coef(m_1a)
+
+# 95% credible interval for the grand mean
+confint(m_1a)
+```
+
+Check MCMC diagnostics:
+
+```{r m1a-diagnostics}
+# Trace plots via bayesplot
+library(bayesplot)
+mcmc_trace(m_1a$greta$draws)
+mcmc_dens(m_1a$greta$draws)
+
+# Built-in diagnostic plots
+plot(m_1a, type = "diagnostics")
+plot(m_1a, type = "residuals")
+```
+
+**Interpretation:** The intercept estimate is the posterior mean of
+$\mu$, which should be close to `mean(PlantGrowth$weight)` ($\approx$
+5.07). The 95% credible interval (CrI) gives the range within which
+$\mu$ lies with 95% posterior probability --- a direct probability
+statement, unlike frequentist confidence intervals.
+
+
+### Model 1b: Fixed effects (one-way ANOVA)
+
+Add the treatment group as a fixed effect:
+
+$$
+y_{ij} = \mu + \tau_j + \varepsilon_{ij}, \qquad j \in \{\text{ctrl},\,\text{trt1},\,\text{trt2}\}
+$$
+
+With the default treatment contrasts, `bayesreml` estimates $\mu$ (the
+mean of the reference level, ctrl) and $\tau_j$ (deviations from ctrl).
+
+```{r m1b-fit}
+m_1b <- bayesreml(
+  fixed     = weight ~ group,
+  data      = PlantGrowth,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_1b)
+```
+
+Extract coefficients and credible intervals:
+
+```{r m1b-coefs}
+coef(m_1b)
+confint(m_1b)
+
+# Tidy output (broom-style)
+tidy(m_1b, conf.int = TRUE)
+```
+
+Forest plot of fixed effects:
+
+```{r m1b-effects-plot}
+plot(m_1b, type = "effects")
+```
+
+**Interpretation:** If the 95% CrI for `grouptrt2` excludes zero, there
+is strong posterior evidence that treatment 2 differs from the control.
+The `grouptrt1` effect is typically small and its CrI often includes
+zero, suggesting no clear difference from control.
+
+
+### Comparison with stats::lm()
+
+```{r m1b-lm-compare}
+lm_1b <- lm(weight ~ group, data = PlantGrowth)
+summary(lm_1b)
+
+# Side-by-side comparison
+comparison <- data.frame(
+  term      = names(coef(m_1b)),
+  bayesreml = round(coef(m_1b), 4),
+  lm        = round(coef(lm_1b), 4)
+)
+print(comparison)
+```
+
+With weakly informative priors (the default `prior_fixed_sd = 10`),
+posterior means should closely match OLS estimates for this small model.
+
+
+### Estimated marginal means and pairwise comparisons
+
+```{r m1b-emmeans}
+# Group-level estimated marginal means
+emm_1b <- emmeans(m_1b, ~ group)
+emm_1b
+
+# All pairwise comparisons
+pairs_1b <- pairs(emm_1b)
+pairs_1b
+
+# Contrast plot
+plot(pairs_1b) + theme_minimal()
+```
+
+**Interpretation:** The `emmeans` output reports posterior-based
+estimated marginal means on the response scale. The `pairs()` output
+shows all pairwise differences; look for intervals that exclude zero to
+identify significant contrasts.
+
+
+### Publication-quality bar chart with credible intervals
+
+```{r m1b-ggplot, fig.width=5, fig.height=4}
+# Extract emmeans as a data frame
+emm_df <- as.data.frame(emm_1b)
+
+ggplot(emm_df, aes(x = group, y = emmean)) +
+  geom_col(aes(fill = group), width = 0.6, colour = "grey30",
+           show.legend = FALSE) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                width = 0.15, linewidth = 0.6) +
+  scale_fill_manual(values = c("ctrl" = "#7fc97f",
+                                "trt1" = "#beaed4",
+                                "trt2" = "#fdc086")) +
+  labs(
+    x     = "Treatment group",
+    y     = "Plant weight (g)",
+    title = "Estimated marginal means with 95% CrI"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+
+
+### Model 1c: Adding a continuous covariate
+
+To demonstrate covariate adjustment, we create a synthetic covariate
+(initial plant height, centred) and fit a model with both the group
+effect and the covariate:
+
+$$
+y_{ij} = \mu + \tau_j + \beta \cdot x_i + \varepsilon_{ij}
+$$
+
+```{r m1c-data}
+set.seed(42)
+PlantGrowth$height <- scale(rnorm(nrow(PlantGrowth), mean = 10, sd = 2))[, 1]
+```
+
+```{r m1c-fit}
+m_1c <- bayesreml(
+  fixed     = weight ~ group + height,
+  data      = PlantGrowth,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_1c)
+```
+
+```{r m1c-coefs}
+# Covariate effect
+coef(m_1c)
+confint(m_1c)
+
+# Adjusted emmeans (averaging over height)
+emmeans(m_1c, ~ group)
+```
+
+**Interpretation:** The coefficient for `height` represents the expected
+change in plant weight per unit increase in centred initial height.
+The group means from `emmeans()` are now adjusted for height, providing
+more precise estimates when height explains substantial variation.
+
+
+## Part B: Fisher barley dataset
+
+The `agridat::fisher.barley` dataset contains barley yields across
+multiple years and locations, providing a richer context.
+
+```{r data-barley}
+data(fisher.barley, package = "agridat")
+str(fisher.barley)
+```
+
+### Intercept-only model
+
+```{r barley-null}
+m_bar_null <- bayesreml(
+  fixed     = yield ~ 1,
+  data      = fisher.barley,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_bar_null)
+```
+
+### Fixed effects model with genotype and environment
+
+```{r barley-fixed}
+m_bar_fix <- bayesreml(
+  fixed     = yield ~ gen + env,
+  data      = fisher.barley,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_bar_fix)
+```
+
+### Estimated marginal means by genotype
+
+```{r barley-emmeans}
+emm_gen <- emmeans(m_bar_fix, ~ gen)
+emm_gen
+
+pairs(emm_gen, adjust = "tukey")
+```
+
+### Model comparison
+
+```{r barley-anova}
+anova(m_bar_null, m_bar_fix)
+```
+
+**Interpretation:** The `anova()` method provides approximate DIC-based
+model comparison. A lower DIC indicates better model fit penalised by
+complexity. Large differences in DIC (> 5--10) suggest meaningful
+improvement.
+
+
+### Visualising genotype effects
+
+```{r barley-ggplot, fig.width=7, fig.height=5}
+emm_gen_df <- as.data.frame(emm_gen)
+emm_gen_df <- emm_gen_df[order(emm_gen_df$emmean), ]
+emm_gen_df$gen <- factor(emm_gen_df$gen, levels = emm_gen_df$gen)
+
+ggplot(emm_gen_df, aes(x = emmean, y = gen)) +
+  geom_point(size = 2.5, colour = "#0072B2") +
+  geom_errorbarh(aes(xmin = lower.CL, xmax = upper.CL),
+                 height = 0.25, colour = "#0072B2") +
+  geom_vline(xintercept = mean(emm_gen_df$emmean),
+             linetype = "dashed", colour = "grey50") +
+  labs(
+    x     = "Yield (adjusted marginal mean)",
+    y     = "Genotype",
+    title = "Genotype effects: posterior marginal means with 95% CrI"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+## Checking generated greta code
+
+`bayesreml` translates the formula into greta code. You can inspect this
+without fitting:
+
+```{r generated-code}
+code <- bayesreml(
+  fixed       = weight ~ group,
+  data        = PlantGrowth,
+  return_code = TRUE
+)
+cat(code)
+```
+
+Or after fitting:
+
+```{r generated-code-post}
+cat(m_1b$extras$code)
+```
+
+
+## Posterior predictive checks
+
+```{r pp-check}
+plot(m_1b, type = "pp_check")
+```
+
+**Interpretation:** The posterior predictive check overlays the observed
+data distribution with the model's predicted distribution. Good
+agreement indicates that the model captures the data-generating process
+adequately.
+
+
+## Summary
+
+| Model  | Formula                   | Description               | Key output       |
+|--------|---------------------------|---------------------------|-------------------|
+| `m_1a` | `weight ~ 1`              | Null / intercept only     | Grand mean, CrI   |
+| `m_1b` | `weight ~ group`          | One-way ANOVA             | Group means, pairs |
+| `m_1c` | `weight ~ group + height` | ANCOVA with covariate     | Adjusted means     |
+
+Key takeaways:
+
+1. `bayesreml()` uses the same `fixed = response ~ predictors` syntax as
+   ASReml and standard R modelling functions.
+2. The `$glm` component provides full compatibility with `emmeans`,
+   `marginaleffects`, `summary()`, `confint()`, etc.
+3. The `$greta` component gives access to raw MCMC draws for
+   `bayesplot` diagnostics.
+4. The `$extras` component contains variance components, BLUPs, and
+   convergence diagnostics.
+5. With weakly informative priors, Bayesian estimates closely match
+   frequentist OLS for simple models.
+6. Credible intervals provide direct probability statements about
+   parameters, which is a fundamental advantage over frequentist
+   confidence intervals.
+
+The next tutorial covers **random effects** for designs where factor
+levels are sampled from a larger population.

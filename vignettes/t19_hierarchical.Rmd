@@ -1,0 +1,713 @@
+---
+title: "Tutorial 19: Hierarchical (Multi-Level) Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 19: Hierarchical (Multi-Level) Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+This tutorial covers hierarchical (multi-level) models that account for
+nested and crossed grouping structures. These models are fundamental to
+mixed-effects modelling and are a core strength of the ASReml framework.
+You will learn how to:
+
+- Fit three-level nested models (environment / replicate / block)
+- Decompose variance across multiple hierarchical levels
+- Fit cross-classified random effects (students x instructors)
+- Model random slopes at different hierarchical levels
+- Fit longitudinal random intercept + slope models
+- Quantify design effects and effective sample sizes
+- Produce nested dot plots and multi-level caterpillar plots
+- Compare results with `lme4::lmer()`
+
+We use `lme4::Pastes` (paste strength; batch/cask, 60 observations) for
+nested structures and a subset of `lme4::InstEval` for cross-classified
+designs.
+
+## Mathematical background
+
+### Three-level nested model
+
+For a design with observations nested within blocks within replicates:
+
+$$
+y_{ijk} = \mu + b_i + c_{j(i)} + \varepsilon_{ijk}
+$$
+
+where $b_i \sim \mathcal{N}(0, \sigma_b^2)$ is the level-2 (batch)
+random effect and $c_{j(i)} \sim \mathcal{N}(0, \sigma_c^2)$ is the
+level-3 (cask within batch) random effect. The variance decomposition is:
+
+$$
+\text{Var}(y) = \sigma_b^2 + \sigma_c^2 + \sigma_e^2
+$$
+
+The **intra-class correlations** at each level are:
+
+$$
+\text{ICC}_{\text{batch}} = \frac{\sigma_b^2}{\sigma_b^2 + \sigma_c^2 + \sigma_e^2}, \qquad
+\text{ICC}_{\text{cask|batch}} = \frac{\sigma_b^2 + \sigma_c^2}{\sigma_b^2 + \sigma_c^2 + \sigma_e^2}
+$$
+
+### Cross-classified model
+
+When observations belong to two non-nested grouping factors (e.g.,
+students and instructors):
+
+$$
+y_{ij} = \mu + \alpha_i + \beta_j + \varepsilon_{ij}
+$$
+
+where $\alpha_i \sim \mathcal{N}(0, \sigma_\alpha^2)$ and
+$\beta_j \sim \mathcal{N}(0, \sigma_\beta^2)$ are independent random
+effects for the two crossed factors.
+
+### Design effect
+
+The **design effect** quantifies how much a clustering structure inflates
+the variance of the sample mean relative to simple random sampling:
+
+$$
+\text{DEFF} = 1 + (m - 1) \cdot \text{ICC}
+$$
+
+where $m$ is the average cluster size. A DEFF of 2 means the effective
+sample size is halved by clustering.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(patchwork)
+```
+
+
+## Part A: Three-level nested model
+
+### Data: Pastes
+
+```{r data-pastes}
+data(Pastes, package = "lme4")
+str(Pastes)
+# 60 observations: strength (response), batch (10 levels), cask (3 per batch)
+# sample nested within cask nested within batch
+
+# Ensure correct nesting structure
+Pastes$batch_cask <- interaction(Pastes$batch, Pastes$cask)
+```
+
+```{r pastes-explore, fig.width=7, fig.height=5}
+ggplot(Pastes, aes(x = reorder(batch, strength, FUN = median),
+                   y = strength)) +
+  geom_boxplot(aes(fill = batch), show.legend = FALSE, alpha = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+  labs(
+    x = "Batch (ordered by median strength)",
+    y = "Paste strength",
+    title = "Pastes data: variation across batches and casks"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+### Model 19a: Three-level nested random effects
+
+```{r m19a-fit}
+m_19a <- bayesreml(
+  fixed   = strength ~ 1,
+  random  = ~ batch + batch:cask,
+  data    = Pastes,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_19a)
+```
+
+
+### Comparison with lme4
+
+```{r m19a-lmer}
+lmer_19a <- lmer(strength ~ 1 + (1 | batch) + (1 | batch:cask),
+                 data = Pastes)
+summary(lmer_19a)
+```
+
+```{r m19a-compare}
+# Side-by-side variance components
+vc_bayes <- m_19a$extras$variance_components
+vc_lmer  <- as.data.frame(VarCorr(lmer_19a))
+
+vc_compare <- data.frame(
+  level = c("batch", "batch:cask", "residual"),
+  bayesreml = c(vc_bayes$batch, vc_bayes$`batch:cask`, vc_bayes$residual),
+  lmer      = vc_lmer$vcov
+)
+
+print(round(vc_compare, 3))
+```
+
+
+### Variance decomposition
+
+```{r m19a-vpc, fig.width=6, fig.height=4}
+total_var <- sum(vc_compare$bayesreml)
+
+vpc_df <- data.frame(
+  level = c("Batch", "Cask within batch", "Residual"),
+  variance = vc_compare$bayesreml,
+  proportion = vc_compare$bayesreml / total_var * 100
+)
+vpc_df$level <- factor(vpc_df$level,
+                       levels = c("Residual", "Cask within batch", "Batch"))
+
+ggplot(vpc_df, aes(x = "", y = proportion, fill = level)) +
+  geom_col(width = 0.6, colour = "white") +
+  coord_flip() +
+  scale_fill_manual(values = c("Batch" = "#0072B2",
+                                "Cask within batch" = "#56B4E9",
+                                "Residual" = "#E0E0E0"),
+                    name = NULL) +
+  geom_text(aes(label = paste0(round(proportion, 1), "%")),
+            position = position_stack(vjust = 0.5), size = 4,
+            fontface = "bold") +
+  labs(
+    x = NULL, y = "Variance (%)",
+    title = "Variance partition across hierarchical levels"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+```
+
+
+### ICC and design effect
+
+```{r m19a-icc}
+sigma2_b <- vc_bayes$batch
+sigma2_c <- vc_bayes$`batch:cask`
+sigma2_e <- vc_bayes$residual
+
+icc_batch <- sigma2_b / (sigma2_b + sigma2_c + sigma2_e)
+icc_cask  <- (sigma2_b + sigma2_c) / (sigma2_b + sigma2_c + sigma2_e)
+
+cat("ICC (batch):              ", round(icc_batch, 3), "\n")
+cat("ICC (cask within batch):  ", round(icc_cask, 3), "\n")
+
+# Design effect (average cask size = 2, batch size = 6)
+deff_batch <- 1 + (6 - 1) * icc_batch
+deff_cask  <- 1 + (2 - 1) * (icc_cask - icc_batch)
+cat("Design effect (batch):    ", round(deff_batch, 2), "\n")
+cat("Effective sample size:    ", round(60 / deff_batch, 1), "\n")
+```
+
+
+### Nested dot plot of variation at each level
+
+```{r m19a-dotplot, fig.width=8, fig.height=6}
+# Extract BLUPs at each level
+blup_batch <- m_19a$extras$random_effects$batch
+blup_cask  <- m_19a$extras$random_effects$`batch:cask`
+ci_batch   <- m_19a$extras$random_ci$batch
+ci_cask    <- m_19a$extras$random_ci$`batch:cask`
+
+batch_df <- data.frame(
+  name     = names(blup_batch),
+  estimate = blup_batch,
+  lower    = ci_batch[, 1],
+  upper    = ci_batch[, 2],
+  level    = "Batch"
+)
+
+cask_df <- data.frame(
+  name     = names(blup_cask),
+  estimate = blup_cask,
+  lower    = ci_cask[, 1],
+  upper    = ci_cask[, 2],
+  level    = "Cask within batch"
+)
+
+blup_all <- bind_rows(batch_df, cask_df)
+blup_all <- blup_all %>%
+  group_by(level) %>%
+  mutate(name = reorder(name, estimate)) %>%
+  ungroup()
+
+ggplot(blup_all, aes(x = estimate, y = name)) +
+  geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.3,
+                 colour = "grey50") +
+  geom_point(aes(colour = level), size = 2) +
+  facet_wrap(~ level, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = c("Batch" = "#0072B2",
+                                  "Cask within batch" = "#56B4E9")) +
+  labs(
+    x = "Random effect estimate (BLUP) with 95% CrI",
+    y = NULL,
+    title = "Caterpillar plots at each hierarchical level"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+**Interpretation:** The caterpillar plot reveals the magnitude of
+variation at each level. If batch-level intervals are wide and largely
+non-overlapping, batch explains substantial variation. Cask-within-batch
+effects are typically smaller and show more overlap with zero.
+
+
+### Shrinkage at each level
+
+```{r m19a-shrinkage, fig.width=8, fig.height=4}
+# Compute "raw" group means for comparison
+raw_batch_means <- Pastes %>%
+  group_by(batch) %>%
+  summarise(raw = mean(strength) - mean(Pastes$strength), .groups = "drop")
+
+raw_cask_means <- Pastes %>%
+  group_by(batch, cask) %>%
+  summarise(raw = mean(strength) - mean(Pastes$strength), .groups = "drop") %>%
+  mutate(batch_cask = paste(batch, cask, sep = "."))
+
+shrink_batch <- data.frame(
+  raw   = raw_batch_means$raw,
+  blup  = blup_batch[as.character(raw_batch_means$batch)],
+  level = "Batch"
+)
+
+shrink_cask <- data.frame(
+  raw   = raw_cask_means$raw,
+  blup  = blup_cask[raw_cask_means$batch_cask],
+  level = "Cask within batch"
+)
+
+shrink_all <- bind_rows(shrink_batch, shrink_cask)
+
+ggplot(shrink_all, aes(x = raw, y = blup)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey60") +
+  geom_point(aes(colour = level), size = 2.5, alpha = 0.8) +
+  facet_wrap(~ level) +
+  scale_colour_manual(values = c("Batch" = "#0072B2",
+                                  "Cask within batch" = "#56B4E9")) +
+  labs(
+    x = "Raw group mean deviation",
+    y = "Bayesian BLUP",
+    title = "Shrinkage of random effects toward zero",
+    subtitle = "Points below the diagonal are shrunk toward the grand mean"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+
+## Part B: Cross-classified random effects
+
+### Data: InstEval (subset)
+
+```{r data-insteval}
+data(InstEval, package = "lme4")
+
+# Take a manageable subset: first 1000 observations
+set.seed(123)
+insteval_sub <- InstEval[sample(nrow(InstEval), 1000), ]
+insteval_sub$s <- factor(insteval_sub$s)  # student
+insteval_sub$d <- factor(insteval_sub$d)  # instructor
+
+n_students    <- length(unique(insteval_sub$s))
+n_instructors <- length(unique(insteval_sub$d))
+cat("Students:    ", n_students, "\n")
+cat("Instructors: ", n_instructors, "\n")
+cat("Observations:", nrow(insteval_sub), "\n")
+```
+
+
+### Model 19b: Cross-classified (students x instructors)
+
+```{r m19b-fit}
+m_19b <- bayesreml(
+  fixed   = y ~ service,
+  random  = ~ s + d,
+  data    = insteval_sub,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_19b)
+```
+
+```{r m19b-lmer}
+lmer_19b <- lmer(y ~ service + (1 | s) + (1 | d), data = insteval_sub)
+summary(lmer_19b)
+```
+
+```{r m19b-vc}
+vc_19b <- m_19b$extras$variance_components
+total_19b <- sum(unlist(vc_19b))
+
+cat("Variance decomposition:\n")
+cat("  Student:    ", round(vc_19b$s, 3),
+    " (", round(vc_19b$s / total_19b * 100, 1), "%)\n")
+cat("  Instructor: ", round(vc_19b$d, 3),
+    " (", round(vc_19b$d / total_19b * 100, 1), "%)\n")
+cat("  Residual:   ", round(vc_19b$residual, 3),
+    " (", round(vc_19b$residual / total_19b * 100, 1), "%)\n")
+```
+
+**Interpretation:** In cross-classified designs, both factors contribute
+to the total variance. If instructor variance is substantial (e.g.,
+> 10%), there are meaningful differences between instructors in teaching
+evaluations beyond student-level noise.
+
+
+### Cross-classified caterpillar plots
+
+```{r m19b-caterpillar, fig.width=8, fig.height=6}
+# Student BLUPs (show top/bottom 20)
+blup_s <- m_19b$extras$random_effects$s
+ci_s <- m_19b$extras$random_ci$s
+
+student_df <- data.frame(
+  name = names(blup_s), estimate = blup_s,
+  lower = ci_s[, 1], upper = ci_s[, 2]
+) %>%
+  arrange(estimate) %>%
+  slice(c(1:10, (n() - 9):n())) %>%
+  mutate(name = reorder(name, estimate))
+
+# Instructor BLUPs (show top/bottom 20)
+blup_d <- m_19b$extras$random_effects$d
+ci_d <- m_19b$extras$random_ci$d
+
+instr_df <- data.frame(
+  name = names(blup_d), estimate = blup_d,
+  lower = ci_d[, 1], upper = ci_d[, 2]
+) %>%
+  arrange(estimate) %>%
+  slice(c(1:10, (n() - 9):n())) %>%
+  mutate(name = reorder(name, estimate))
+
+p_s <- ggplot(student_df, aes(x = estimate, y = name)) +
+  geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.3,
+                 colour = "grey50") +
+  geom_point(colour = "#0072B2", size = 2) +
+  labs(x = "BLUP", y = NULL, title = "Students (top/bottom 10)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_d <- ggplot(instr_df, aes(x = estimate, y = name)) +
+  geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.3,
+                 colour = "grey50") +
+  geom_point(colour = "#D55E00", size = 2) +
+  labs(x = "BLUP", y = NULL, title = "Instructors (top/bottom 10)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+p_s + p_d +
+  plot_annotation(
+    title = "Cross-classified caterpillar plots",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+```
+
+
+## Part C: Multilevel slopes
+
+### Model 19c: Random slopes at different levels
+
+Extend the Pastes model to include a synthetic covariate with random
+slopes varying across batches:
+
+```{r m19c-data}
+set.seed(99)
+Pastes$temperature <- scale(rnorm(nrow(Pastes), mean = 20, sd = 5))[, 1]
+```
+
+```{r m19c-fit}
+m_19c <- bayesreml(
+  fixed   = strength ~ temperature,
+  random  = ~ batch + batch:cask + us(temperature):batch,
+  data    = Pastes,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_19c)
+```
+
+```{r m19c-slopes, fig.width=7, fig.height=5}
+# Extract batch-specific slopes
+slopes_batch <- m_19c$extras$random_effects$`temperature:batch`
+intercepts_batch <- m_19c$extras$random_effects$batch
+
+slope_df <- data.frame(
+  batch     = names(slopes_batch),
+  intercept = intercepts_batch[names(slopes_batch)],
+  slope     = slopes_batch
+)
+
+# Grand mean intercept and slope
+grand_int <- coef(m_19c)[1]
+grand_slope <- coef(m_19c)["temperature"]
+
+ggplot() +
+  # Batch-specific regression lines
+  geom_abline(data = slope_df,
+              aes(intercept = grand_int + intercept,
+                  slope = grand_slope + slope,
+                  colour = batch),
+              linewidth = 0.6, alpha = 0.7, show.legend = FALSE) +
+  # Grand mean line
+  geom_abline(intercept = grand_int, slope = grand_slope,
+              linewidth = 1.5, colour = "black", linetype = "dashed") +
+  # Data points
+  geom_point(data = Pastes, aes(x = temperature, y = strength,
+                                 colour = batch),
+             alpha = 0.5, show.legend = FALSE) +
+  labs(
+    x = "Temperature (standardised)",
+    y = "Paste strength",
+    title = "Random slopes: batch-specific temperature effects",
+    subtitle = "Dashed black = population average; coloured = batch-specific"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r m19c-slope-intercept, fig.width=6, fig.height=5}
+ggplot(slope_df, aes(x = intercept, y = slope)) +
+  geom_point(size = 3, colour = "#0072B2") +
+  geom_text(aes(label = batch), nudge_y = 0.02, size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  labs(
+    x = "Random intercept (batch)",
+    y = "Random slope (temperature within batch)",
+    title = "Intercept-slope correlation",
+    subtitle = "Positive correlation implies high-strength batches are more temperature-sensitive"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+## Part D: Longitudinal random intercept + slope
+
+### Data: Orthodont (dental growth)
+
+```{r data-orthodont}
+data(Orthodont, package = "nlme")
+Orthodont <- as.data.frame(Orthodont)
+str(Orthodont)
+# 108 observations: distance (response), age (8-14), Subject, Sex
+```
+
+```{r orthodont-explore, fig.width=7, fig.height=5}
+ggplot(Orthodont, aes(x = age, y = distance, group = Subject,
+                      colour = Sex)) +
+  geom_line(alpha = 0.5) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  facet_wrap(~ Sex) +
+  labs(
+    x = "Age (years)", y = "Distance (mm)",
+    title = "Orthodontic growth curves by subject"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+
+### Model 19d: Random intercept + random slope for age
+
+$$
+y_{ij} = (\beta_0 + u_{0i}) + (\beta_1 + u_{1i}) \cdot \text{age}_{ij} + \varepsilon_{ij}
+$$
+
+where $(u_{0i}, u_{1i})^\top \sim \mathcal{N}(\mathbf{0}, \mathbf{D})$
+and $\mathbf{D}$ is the $2 \times 2$ random-effects covariance matrix.
+
+```{r m19d-fit}
+m_19d <- bayesreml(
+  fixed   = distance ~ age * Sex,
+  random  = ~ us(1 + age):Subject,
+  data    = Orthodont,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_19d)
+```
+
+```{r m19d-lmer}
+lmer_19d <- lmer(distance ~ age * Sex + (1 + age | Subject),
+                 data = Orthodont)
+summary(lmer_19d)
+```
+
+```{r m19d-vc}
+# Random effects covariance matrix D
+D_hat <- m_19d$extras$D_matrix
+cat("Random effects covariance matrix D:\n")
+print(round(D_hat, 4))
+
+# Correlation between intercept and slope
+cor_int_slope <- D_hat[1, 2] / sqrt(D_hat[1, 1] * D_hat[2, 2])
+cat("\nCorrelation(intercept, slope):", round(cor_int_slope, 3), "\n")
+```
+
+
+### Subject-specific growth curves
+
+```{r m19d-curves, fig.width=8, fig.height=6}
+# Extract subject-specific intercepts and slopes
+re_subj <- m_19d$extras$random_effects$Subject
+int_subj <- re_subj[, 1]
+slope_subj <- re_subj[, 2]
+
+beta <- coef(m_19d)
+subjects <- unique(Orthodont$Subject)
+
+# Build prediction data
+pred_df <- expand.grid(
+  age = seq(8, 14, by = 0.5),
+  Subject = subjects
+) %>%
+  left_join(
+    data.frame(Subject = subjects,
+               Sex = Orthodont$Sex[match(subjects, Orthodont$Subject)]),
+    by = "Subject"
+  ) %>%
+  mutate(
+    sex_effect = ifelse(Sex == "Female", beta["SexFemale"], 0),
+    int_effect = ifelse(Sex == "Female", beta["age:SexFemale"], 0),
+    fitted = (beta["(Intercept)"] + sex_effect +
+              int_subj[as.character(Subject)]) +
+             (beta["age"] + int_effect +
+              slope_subj[as.character(Subject)]) * age
+  )
+
+ggplot(pred_df, aes(x = age, y = fitted, group = Subject, colour = Sex)) +
+  geom_line(alpha = 0.4) +
+  geom_point(data = Orthodont, aes(y = distance), alpha = 0.4, size = 1) +
+  # Population average lines
+  geom_abline(intercept = beta["(Intercept)"],
+              slope = beta["age"],
+              linewidth = 1.5, linetype = "dashed", colour = "#0072B2") +
+  geom_abline(intercept = beta["(Intercept)"] + beta["SexFemale"],
+              slope = beta["age"] + beta["age:SexFemale"],
+              linewidth = 1.5, linetype = "dashed", colour = "#D55E00") +
+  scale_colour_manual(values = c("Male" = "#0072B2", "Female" = "#D55E00")) +
+  labs(
+    x = "Age (years)", y = "Distance (mm)",
+    title = "Subject-specific growth curves with population averages",
+    subtitle = "Dashed lines = population average by sex"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+### Random effects bivariate distribution
+
+```{r m19d-bivariate, fig.width=6, fig.height=5}
+re_df <- data.frame(
+  Subject   = subjects,
+  intercept = int_subj,
+  slope     = slope_subj,
+  Sex       = Orthodont$Sex[match(subjects, Orthodont$Subject)]
+)
+
+ggplot(re_df, aes(x = intercept, y = slope)) +
+  geom_point(aes(colour = Sex), size = 3) +
+  stat_ellipse(level = 0.95, linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+  scale_colour_manual(values = c("Male" = "#0072B2", "Female" = "#D55E00")) +
+  labs(
+    x = "Random intercept (baseline distance)",
+    y = "Random slope (growth rate)",
+    title = "Bivariate random effects with 95% ellipse",
+    subtitle = paste0("Correlation = ", round(cor_int_slope, 2))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+**Interpretation:** A positive intercept-slope correlation means that
+subjects who start with larger distances also grow faster. A negative
+correlation implies compensatory growth (smaller baseline, faster
+growth). The 95% ellipse visualises the estimated bivariate normal
+distribution $\mathcal{N}(\mathbf{0}, \mathbf{D})$.
+
+
+## Summary
+
+| Model | Random structure | Design | Key output |
+|-------|-----------------|--------|------------|
+| `m_19a` | `~ batch + batch:cask` | 3-level nested | ICC, variance partition |
+| `m_19b` | `~ s + d` | Cross-classified | Student & instructor BLUPs |
+| `m_19c` | `~ batch + us(temperature):batch` | Random slopes | Slope-intercept correlation |
+| `m_19d` | `~ us(1 + age):Subject` | Longitudinal | Growth curves, $\mathbf{D}$ matrix |
+
+Key takeaways:
+
+1. Hierarchical models decompose total variance into level-specific
+   components (batch, cask, residual), each quantified by a variance
+   component and ICC.
+2. Cross-classified designs require both grouping factors as separate
+   random terms, not nested. `bayesreml` handles this naturally via
+   `random = ~ s + d`.
+3. The design effect translates the ICC into a practical measure of
+   how much clustering reduces effective sample size.
+4. Random slopes capture heterogeneity in covariate effects across
+   groups. The intercept-slope correlation provides insight into whether
+   high-baseline units also show stronger covariate responses.
+5. Caterpillar plots (one per level) are essential for communicating
+   the magnitude and uncertainty of random effects at each hierarchical
+   level.
+6. Longitudinal models with random intercepts and slopes capture
+   individual growth trajectories. The $\mathbf{D}$ matrix summarises
+   between-subject variability in both baseline and growth rate.
+7. Results from `bayesreml` closely match `lme4::lmer()` when priors
+   are weakly informative, providing validation of the Bayesian
+   implementation.

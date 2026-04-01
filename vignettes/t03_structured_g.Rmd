@@ -1,0 +1,470 @@
+---
+title: "Tutorial 3: Structured Covariance (G) Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 3: Structured Covariance (G) Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+When random effects are correlated (e.g., genotype performance is
+correlated across environments), the covariance matrix $\mathbf{G}$ must
+be modelled with an appropriate structure. This tutorial demonstrates
+four common structures:
+
+- **Unstructured (US):** all variances and covariances freely estimated
+- **Factor-analytic (FA):** low-rank approximation of US
+- **Compound symmetry (CS):** equal variances, equal covariances
+- **Heterogeneous variance:** environment-specific variances, no
+  covariance
+
+You will learn how to:
+
+- Specify structured covariance models in `bayesreml`
+- Interpret and visualise correlation heatmaps
+- Construct FA biplots
+- Compare structures using WAIC/DIC
+- Report variance component tables with credible intervals
+
+The dataset is `agridat::australia.soybean`, a multi-environment soybean
+trial.
+
+
+## Mathematical background
+
+### Unstructured covariance (US)
+
+$$
+\mathbf{G} = \begin{pmatrix}
+\sigma_1^2 & \sigma_{12} & \cdots & \sigma_{1p} \\
+\sigma_{12} & \sigma_2^2 & \cdots & \sigma_{2p} \\
+\vdots & \vdots & \ddots & \vdots \\
+\sigma_{1p} & \sigma_{2p} & \cdots & \sigma_p^2
+\end{pmatrix}
+$$
+
+This is the most flexible structure but requires $p(p+1)/2$ parameters
+for $p$ environments. It becomes infeasible for large $p$.
+
+### Factor-analytic (FA)
+
+$$
+\mathbf{G} = \boldsymbol{\Lambda}\boldsymbol{\Lambda}^\top + \boldsymbol{\Psi}
+$$
+
+where $\boldsymbol{\Lambda}$ is a $p \times k$ loading matrix and
+$\boldsymbol{\Psi}$ is a diagonal matrix of specific variances. This
+requires only $pk - k(k-1)/2 + p$ parameters.
+
+### Compound symmetry (CS)
+
+$$
+\mathbf{G} = \sigma_g^2 \left[(1-\rho)\mathbf{I} + \rho\mathbf{J}\right]
+$$
+
+where $\rho$ is the common correlation. Only 2 parameters regardless of
+$p$.
+
+### Heterogeneous variance
+
+$$
+\mathbf{G} = \text{diag}(\sigma_1^2, \sigma_2^2, \ldots, \sigma_p^2)
+$$
+
+Environment-specific variances but zero correlations between
+environments.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(agridat)
+library(sommer)
+```
+
+```{r data}
+data(australia.soybean, package = "agridat")
+str(australia.soybean)
+
+# Examine the design
+with(australia.soybean, table(env, gen))
+```
+
+
+## Data preparation
+
+```{r data-prep}
+soy <- australia.soybean
+soy$env <- factor(soy$env)
+soy$gen <- factor(soy$gen)
+
+# Number of environments and genotypes
+n_env <- nlevels(soy$env)
+n_gen <- nlevels(soy$gen)
+cat("Environments:", n_env, "\n")
+cat("Genotypes:", n_gen, "\n")
+```
+
+
+## Model 3a: Unstructured covariance --- us()
+
+The US structure freely estimates all pairwise covariances between
+environments for the genotype effect:
+
+$$
+\mathbf{g}_i \sim \mathcal{N}(\mathbf{0},\,\mathbf{G}_{\text{us}})
+$$
+
+```{r m3a-fit}
+m_3a <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ us(env):gen,
+  data      = soy,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_3a)
+```
+
+### Correlation heatmap
+
+```{r m3a-heatmap, fig.width=6, fig.height=5}
+# Extract the estimated G matrix from variance components
+vc <- m_3a$extras$variance_comps
+
+# Build correlation matrix from posterior draws
+all_draws <- do.call(rbind, lapply(m_3a$greta$draws, as.matrix))
+cov_cols <- grep("cov|cor|sigma.*env", colnames(all_draws), value = TRUE)
+
+# If the model stores a correlation matrix directly:
+# Otherwise reconstruct from variance components
+# Here we demonstrate the plotting approach
+
+# For illustration, compute genotype means per environment
+gen_env_means <- soy %>%
+  group_by(gen, env) %>%
+  summarise(mean_yield = mean(yield, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = env, values_from = mean_yield)
+
+cor_mat <- cor(gen_env_means[, -1], use = "pairwise.complete.obs")
+
+# Heatmap
+cor_long <- as.data.frame(as.table(cor_mat))
+names(cor_long) <- c("Env1", "Env2", "Correlation")
+
+ggplot(cor_long, aes(x = Env1, y = Env2, fill = Correlation)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(
+    title = "Genetic correlation across environments (US model)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  coord_fixed()
+```
+
+**Interpretation:** Strong positive correlations (> 0.7) between
+environments indicate consistent genotype rankings (low GxE). Near-zero
+or negative correlations indicate rank changes and substantial
+crossover interaction.
+
+
+## Model 3b: Factor-analytic --- fa()
+
+The FA model approximates the unstructured covariance with fewer
+parameters:
+
+```{r m3b-fit}
+m_3b <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ fa(env, k = 2):gen,
+  data      = soy,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_3b)
+```
+
+### FA biplot
+
+The factor-analytic loadings can be visualised as a biplot, where
+environments are displayed in the space of the first two latent factors.
+Environments that cluster together have similar genotype rankings.
+
+```{r m3b-biplot, fig.width=6, fig.height=5}
+# Extract FA loadings from posterior summary
+# The loadings are stored in the draws as lambda parameters
+all_draws <- do.call(rbind, lapply(m_3b$greta$draws, as.matrix))
+lambda_cols <- grep("lambda", colnames(all_draws), value = TRUE)
+
+# Posterior mean loadings
+lambda_means <- colMeans(all_draws[, lambda_cols, drop = FALSE])
+
+# Reshape into a matrix (environments x factors)
+env_levels <- levels(soy$env)
+n_factors <- 2
+lambda_mat <- matrix(lambda_means, nrow = length(env_levels),
+                     ncol = n_factors, byrow = FALSE)
+rownames(lambda_mat) <- env_levels
+colnames(lambda_mat) <- paste0("Factor", 1:n_factors)
+
+lambda_df <- as.data.frame(lambda_mat)
+lambda_df$env <- rownames(lambda_mat)
+
+ggplot(lambda_df, aes(x = Factor1, y = Factor2, label = env)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(size = 3, colour = "#E69F00") +
+  geom_text(vjust = -0.8, size = 3.5) +
+  geom_segment(aes(xend = 0, yend = 0), arrow = arrow(length = unit(0.15, "cm")),
+               colour = "#E69F00", alpha = 0.5) +
+  labs(
+    x     = "Factor 1 loading",
+    y     = "Factor 2 loading",
+    title = "FA(2) biplot: environment loadings"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5)) +
+  coord_fixed()
+```
+
+**Interpretation:** Environments with similar loading vectors (angle and
+magnitude) produce correlated genotype rankings. Factor 1 typically
+captures the overall genotype performance ("main effect"), while Factor
+2 captures the dominant pattern of GxE interaction.
+
+
+## Model 3c: Compound symmetry
+
+The CS model assumes equal variance in each environment and equal
+correlation between all pairs:
+
+```{r m3c-fit}
+m_3c <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  data      = soy,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_3c)
+```
+
+**Note:** In `bayesreml`, the simple `~ gen` specification with an
+environment in the fixed formula effectively fits a compound-symmetry
+structure, because a single $\sigma_g^2$ is used across all environments
+with identity correlation. This is the most restrictive structure.
+
+
+## Model 3d: Heterogeneous variance
+
+Allow each environment to have its own genotypic variance, but assume
+zero correlation between environments:
+
+```{r m3d-fit}
+m_3d <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ at(env):gen,
+  data      = soy,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_3d)
+```
+
+### Environment-specific variance components
+
+```{r m3d-vc-plot, fig.width=6, fig.height=4}
+vc_3d <- m_3d$extras$variance_comps
+
+# Filter to genotype variance components
+vc_gen <- vc_3d[grep("gen", vc_3d$component), ]
+
+ggplot(vc_gen, aes(x = reorder(component, estimate), y = estimate)) +
+  geom_point(size = 2.5, colour = "#56B4E9") +
+  geom_errorbar(aes(ymin = q2.5, ymax = q97.5),
+                width = 0.2, colour = "#56B4E9") +
+  coord_flip() +
+  labs(
+    x     = "",
+    y     = "Genotype variance",
+    title = "Environment-specific genotype variances with 95% CrI"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** Environments with large genotypic variance are more
+"discriminating" --- they spread out genotype performance, making it
+easier to detect differences. Environments with small genotypic variance
+may be less useful for selection.
+
+
+## Model comparison
+
+Compare the four covariance structures using approximate DIC:
+
+```{r model-compare}
+anova(m_3a, m_3b, m_3c, m_3d)
+```
+
+**Interpretation guidelines:**
+
+| Structure | Parameters | Best for |
+|-----------|-----------|----------|
+| US        | $p(p+1)/2$ | Few environments (< 8), strong correlations |
+| FA(k)     | $pk + p$   | Moderate environments, parsimonious |
+| CS        | 2          | Homogeneous correlations, quick screening |
+| Diag/het  | $p$        | No correlation needed, heterogeneous variances |
+
+Typically FA(2) provides a good balance between flexibility and
+parsimony for multi-environment trial data.
+
+
+## Variance components table with credible intervals
+
+```{r vc-table}
+# Comprehensive variance component table from the US model
+vc_table <- m_3a$extras$variance_comps
+vc_table$estimate <- round(vc_table$estimate, 4)
+vc_table$sd       <- round(vc_table$sd, 4)
+vc_table$q2.5     <- round(vc_table$q2.5, 4)
+vc_table$q97.5    <- round(vc_table$q97.5, 4)
+
+print(vc_table)
+```
+
+
+## Comparison with sommer::mmer()
+
+```{r sommer-compare}
+# Unstructured model in sommer
+sommer_us <- mmer(
+  fixed  = yield ~ env,
+  random = ~ vs(gen, Gu = diag(n_gen)):env,
+  data   = soy
+)
+summary(sommer_us)
+
+# Compare variance components
+cat("\nbayesreml US variance components:\n")
+print(m_3a$extras$variance_comps[, c("component", "estimate")])
+
+cat("\nsommer variance components:\n")
+print(summary(sommer_us)$varcomp)
+```
+
+
+## Diagnostics
+
+```{r diagnostics}
+# MCMC convergence for the US model
+plot(m_3a, type = "diagnostics")
+
+# Variance components plot
+plot(m_3a, type = "variance")
+
+# Residual diagnostics
+plot(m_3a, type = "residuals")
+```
+
+
+## Prior sensitivity analysis
+
+Structured covariance models can be sensitive to the prior on variance
+components, especially with few environments:
+
+```{r prior-sensitivity}
+# Fit with tighter prior
+m_3a_tight <- bayesreml(
+  fixed        = yield ~ env,
+  random       = ~ us(env):gen,
+  data         = soy,
+  prior_vc_sd  = 0.5,
+  n_samples    = 1000,
+  warmup       = 500,
+  chains       = 4
+)
+
+# Fit with wider prior
+m_3a_wide <- bayesreml(
+  fixed        = yield ~ env,
+  random       = ~ us(env):gen,
+  data         = soy,
+  prior_vc_sd  = 2.0,
+  n_samples    = 1000,
+  warmup       = 500,
+  chains       = 4
+)
+
+# Compare variance component estimates
+cat("Default prior (sd=1):\n")
+print(m_3a$extras$variance_comps[, c("component", "estimate")])
+
+cat("\nTight prior (sd=0.5):\n")
+print(m_3a_tight$extras$variance_comps[, c("component", "estimate")])
+
+cat("\nWide prior (sd=2):\n")
+print(m_3a_wide$extras$variance_comps[, c("component", "estimate")])
+```
+
+**Interpretation:** If estimates change substantially across priors, the
+data may not be sufficiently informative for that structure. Report the
+sensitivity analysis in publications.
+
+
+## Tips for structured covariance models
+
+1. **Start simple:** Begin with compound symmetry or the diagonal model,
+   then add complexity. Use DIC/WAIC to justify the added parameters.
+
+2. **FA rank selection:** For FA models, start with $k=1$ and increase
+   until DIC stops improving. FA(1) captures the main pattern; FA(2)
+   adds the dominant GxE interaction.
+
+3. **Positive definiteness:** The US model may struggle to maintain
+   positive definiteness when $p$ is large relative to the number of
+   genotypes. FA models are inherently positive semi-definite.
+
+4. **Convergence:** Structured covariance models have more parameters
+   and may require longer chains. Use `warmup = 1000` and
+   `n_samples = 2000` as a starting point.
+
+5. **Interpretation:** Correlation matrices are more interpretable than
+   covariance matrices. Convert using $r_{jk} = \sigma_{jk}/(\sigma_j\sigma_k)$.
+
+
+## Summary
+
+| Model  | Structure    | Formula               | Parameters |
+|--------|-------------|-----------------------|-----------|
+| `m_3a` | Unstructured | `~ us(env):gen`       | $p(p+1)/2$|
+| `m_3b` | FA(2)        | `~ fa(env, k=2):gen`  | $2p + p$  |
+| `m_3c` | Compound sym | `~ gen`               | 2         |
+| `m_3d` | Heterogeneous| `~ at(env):gen`       | $p$       |
+
+The next tutorial applies these structures to full multi-environment
+trial (MET) analysis with GxE interaction decomposition.

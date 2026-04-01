@@ -1,0 +1,687 @@
+---
+title: "ASReml Formula Syntax Reference"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{ASReml Formula Syntax Reference}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Overview
+
+bayesreml uses **ASReml-style formula syntax** so that users familiar with
+ASReml can transition to Bayesian estimation with minimal code changes. This
+vignette is a complete reference for every formula construct that bayesreml
+supports, organised by the three formula arguments: `fixed`, `random`, and
+`rcov`.
+
+Throughout this vignette, we use the bundled `met_example` dataset:
+
+```{r data}
+library(bayesreml)
+data(met_example)
+dat <- met_example$dat
+str(dat)
+```
+
+## The three formula arguments
+
+bayesreml models are specified with up to three formulas:
+```
+bayesreml(fixed = ..., random = ..., rcov = ..., data = ...)
+```
+
+| Argument | Type | Purpose | Default |
+|----------|------|---------|---------|
+| `fixed`  | Two-sided | Response and fixed effects | (required) |
+| `random` | One-sided | Random effects | `NULL` (no random effects) |
+| `rcov`   | One-sided | Residual covariance structure | `~ units` (iid) |
+
+---
+
+## Fixed effects (`fixed`)
+
+The `fixed` formula is a standard R two-sided formula: `response ~ predictors`.
+
+### Intercept
+
+By default, R includes an intercept. You can suppress it with `- 1` or `0`:
+
+```{r fixed-intercept}
+# With intercept (default)
+fit <- bayesreml(yield ~ env, random = ~ geno, data = dat)
+
+# Without intercept (cell-means parameterisation)
+fit <- bayesreml(yield ~ env - 1, random = ~ geno, data = dat)
+```
+
+When the intercept is present, the first level of each factor is absorbed
+(treatment contrasts). Without the intercept, all levels are estimated directly.
+
+### Supported fixed-effect terms
+
+| Term | Example | Description |
+|------|---------|-------------|
+| Factor | `env` | Categorical predictor; one coefficient per level (minus reference) |
+| Continuous | `x_cov` | Numeric predictor; single slope coefficient |
+| Interaction (factor:factor) | `geno:env` | All pairwise level combinations |
+| Interaction (factor:continuous) | `env:x_cov` | Separate slope per factor level |
+| Polynomial / expression | `I(x_cov^2)` | Arbitrary R expression wrapped in `I()` |
+| Crossed (`*`) | `geno * env` | Expands to `geno + env + geno:env` |
+
+### Factor effects
+
+When a column in `data` is a `factor` (or `character`), bayesreml treats it as a
+categorical predictor. With the intercept present, the model uses **treatment
+contrasts** (the first factor level is the reference):
+
+```{r fixed-factor}
+# env has 4 levels: E1 (reference), E2, E3, E4
+# Estimates: intercept + tau_envE2, tau_envE3, tau_envE4
+fit <- bayesreml(yield ~ env, random = ~ geno, data = dat)
+coef(fit)
+```
+
+Without the intercept, all levels are estimated:
+
+```{r fixed-factor-noint}
+# Estimates: alpha_envE1, alpha_envE2, alpha_envE3, alpha_envE4
+fit <- bayesreml(yield ~ env - 1, random = ~ geno, data = dat)
+coef(fit)
+```
+
+### Continuous covariates
+
+Numeric columns are fitted as regression slopes:
+
+```{r fixed-continuous}
+# Single slope for x_cov
+fit <- bayesreml(yield ~ env + x_cov, random = ~ geno, data = dat)
+```
+
+In the generated greta code, a continuous covariate `x_cov` produces a parameter
+`beta_x_cov` with a normal prior:
+$$\beta_{\text{x\_cov}} \sim \text{Normal}(0, \sigma_{\text{fx}}^2)$$
+
+### Interactions
+
+Factor-by-factor interactions create coefficients for all level combinations:
+
+```{r fixed-interaction}
+# Full factorial
+fit <- bayesreml(yield ~ geno * env, data = dat)
+
+# Just the interaction (main effects already in the model)
+fit <- bayesreml(yield ~ geno + env + geno:env, data = dat)
+```
+
+Factor-by-continuous interactions fit separate slopes within each factor level:
+
+```{r fixed-fac-cont}
+fit <- bayesreml(yield ~ env + env:x_cov, random = ~ geno, data = dat)
+```
+
+### Expressions with `I()`
+
+Use `I()` to include arbitrary transformations:
+
+```{r fixed-expression}
+fit <- bayesreml(yield ~ x_cov + I(x_cov^2), random = ~ geno, data = dat)
+```
+
+---
+
+## Random effects (`random`)
+
+The `random` argument is a one-sided formula specifying random terms. This is
+where bayesreml's ASReml compatibility is most powerful. Each random term adds
+one or more variance-component parameters to the model.
+
+### Simple random effects
+
+A simple random effect assumes independent, identically distributed levels:
+$$u_i \sim \text{Normal}(0, \sigma^2_u), \quad i = 1, \ldots, q$$
+
+```{r random-simple}
+# Random genotype effect
+fit <- bayesreml(yield ~ env, random = ~ geno, data = dat)
+
+# Multiple random effects
+fit <- bayesreml(yield ~ env, random = ~ geno + rep, data = dat)
+```
+
+### Nested effects with `:`
+
+The colon operator creates **nested** random effects (equivalent to ASReml's
+nesting syntax). This is useful when block labels are reused across environments:
+
+```{r random-nested}
+# rep nested within env
+fit <- bayesreml(yield ~ env, random = ~ geno + env:rep, data = dat)
+
+# block nested within rep nested within env
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ geno + env:rep:block,
+  data   = dat
+)
+```
+
+### `vm()` --- Variance model (relationship matrices)
+
+`vm()` specifies a random effect with a known covariance structure, typically a
+genomic relationship matrix (GRM) or pedigree-based relationship matrix. This is
+equivalent to ASReml's `vm()` function.
+
+The variance model is:
+$$\mathbf{u} \sim \text{Normal}(\mathbf{0}, \sigma^2_u \mathbf{K})$$
+
+where $\mathbf{K}$ is the known matrix.
+
+```{r random-vm}
+# Genomic BLUP (GBLUP)
+fit <- bayesreml(
+  yield ~ env,
+  random         = ~ vm(geno, Gmat),
+  data           = dat,
+  known_matrices = list(Gmat = met_example$G_mat)
+)
+
+# Pedigree-based model (Animal model)
+fit <- bayesreml(
+  yield ~ env,
+  random         = ~ vm(geno, Amat),
+  data           = dat,
+  known_matrices = list(Amat = met_example$A_mat)
+)
+```
+
+The matrix name in `vm()` must match a name in the `known_matrices` list. The
+matrix must be square with dimension equal to the number of unique levels of the
+grouping factor, and row/column names must match the factor levels.
+
+### `ped()` --- Pedigree model
+
+`ped()` is a convenience wrapper that is functionally equivalent to `vm()` with
+a pedigree-based numerator relationship matrix ($\mathbf{A}$):
+
+```{r random-ped}
+fit <- bayesreml(
+  yield ~ env,
+  random         = ~ ped(geno, Amat),
+  data           = dat,
+  known_matrices = list(Amat = met_example$A_mat)
+)
+```
+
+### `at()` --- Factor-specific effects
+
+`at()` fits separate variance components for each level of a factor. This is
+ASReml's mechanism for heterogeneous variances across environments or other
+groupings:
+
+```{r random-at}
+# Separate genotype variance in each environment
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ at(env):geno,
+  data   = dat
+)
+```
+
+This estimates $\sigma^2_{g,E1}$, $\sigma^2_{g,E2}$, etc. --- one variance
+component per environment.
+
+### `us()` --- Unstructured covariance
+
+`us()` fits a full unstructured (co)variance matrix across factor levels. For a
+factor with $k$ levels, this estimates $k(k+1)/2$ unique parameters (variances
+and covariances):
+
+```{r random-us}
+# Unstructured G x E covariance
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ us(env):geno,
+  data   = dat
+)
+```
+
+The model is:
+$$\mathbf{u}_i \sim \text{Normal}(\mathbf{0}, \boldsymbol{\Sigma})$$
+
+where $\boldsymbol{\Sigma}$ is a $k \times k$ positive-definite matrix estimated
+from the data. bayesreml parameterises this via a Cholesky decomposition to
+ensure positive definiteness.
+
+### `fa()` --- Factor analytic
+
+`fa(factor, k)` fits a factor analytic model of order $k$, a
+reduced-rank approximation to the full unstructured covariance. This is
+particularly useful in MET analysis when the number of environments is large:
+
+$$\boldsymbol{\Sigma} = \boldsymbol{\Lambda}\boldsymbol{\Lambda}^\top +
+\boldsymbol{\Psi}$$
+
+where $\boldsymbol{\Lambda}$ is $k_{\text{env}} \times k$ (loadings) and
+$\boldsymbol{\Psi}$ is diagonal (specific variances).
+
+```{r random-fa}
+# Factor analytic (order 1) for G x E
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ fa(env, 1):geno,
+  data   = dat
+)
+
+# Factor analytic (order 2)
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ fa(env, 2):geno,
+  data   = dat
+)
+```
+
+### `ar1()` --- First-order autoregressive
+
+`ar1()` fits a first-order autoregressive correlation structure along an ordered
+factor (e.g., spatial rows or columns). The correlation between levels $i$ and
+$j$ is $\rho^{|i-j|}$:
+
+```{r random-ar1}
+# Spatial model: AR1 along rows
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ ar1(row):col,
+  data   = dat
+)
+```
+
+### `spl()` --- Spline smooth
+
+`spl()` fits a penalised spline smooth for a continuous or ordered variable.
+This is the equivalent of ASReml's `spl()` function for modelling non-linear
+trends:
+
+```{r random-spl}
+# Spline smooth of a continuous covariate
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ spl(x_cov),
+  data   = dat
+)
+```
+
+### `id()` --- Identity structure
+
+`id()` explicitly requests an identity (diagonal) covariance structure. This is
+the default for simple random effects and is rarely needed, but can be useful for
+clarity:
+
+```{r random-id}
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ id(geno),
+  data   = dat
+)
+```
+
+### `dsum()` --- Direct sum
+
+`dsum()` constructs a direct sum of covariance structures across factor levels.
+This is useful when you want different covariance structures in different
+environments:
+
+```{r random-dsum}
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ dsum(~ geno | env),
+  data   = dat
+)
+```
+
+### Combining multiple random terms
+
+Multiple random terms are separated by `+`:
+
+```{r random-multiple}
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ geno + env:rep + env:rep:block,
+  data   = dat
+)
+```
+
+### Summary of random term types
+
+| Syntax | ASReml equivalent | Covariance structure | Parameters |
+|--------|-------------------|---------------------|------------|
+| `geno` | `geno` | $\sigma^2_g \mathbf{I}$ | 1 |
+| `env:rep` | `env:rep` | $\sigma^2 \mathbf{I}$ (nested) | 1 |
+| `vm(geno, G)` | `vm(geno, source=G)` | $\sigma^2 \mathbf{G}$ | 1 |
+| `ped(geno, A)` | `ped(geno)` | $\sigma^2 \mathbf{A}$ | 1 |
+| `at(env):geno` | `at(env):geno` | $\sigma^2_{g,e}$ per level | $k$ |
+| `us(env):geno` | `us(env):geno` | Full $\boldsymbol{\Sigma}$ | $k(k+1)/2$ |
+| `fa(env, m):geno` | `fa(env, m):geno` | $\boldsymbol{\Lambda\Lambda}^\top + \boldsymbol{\Psi}$ | $mk + k$ |
+| `ar1(row):col` | `ar1(row):col` | AR(1) correlation | 2 |
+| `spl(x_cov)` | `spl(x_cov)` | Penalised spline | 2 |
+| `id(geno)` | `id(geno)` | $\sigma^2 \mathbf{I}$ | 1 |
+| `dsum(~geno\|env)` | `dsum(~geno\|env)` | Direct sum | varies |
+
+---
+
+## Residual structure (`rcov`)
+
+The `rcov` argument specifies the residual (error) covariance structure. The
+default is `~ units`, which gives iid residuals:
+
+$$e_i \sim \text{Normal}(0, \sigma^2_e)$$
+
+### Homogeneous residuals (default)
+
+```{r rcov-units}
+# Explicit (same as default)
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ geno,
+  rcov   = ~ units,
+  data   = dat
+)
+```
+
+### Heterogeneous residuals with `at()`
+
+To allow different residual variances across levels of a factor (e.g.,
+environments), use `at():units`:
+
+```{r rcov-at}
+# Separate residual variance per environment
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ geno,
+  rcov   = ~ at(env):units,
+  data   = dat
+)
+```
+
+This estimates $\sigma^2_{e,E1}$, $\sigma^2_{e,E2}$, $\sigma^2_{e,E3}$,
+$\sigma^2_{e,E4}$ --- one residual variance per environment level.
+
+### Summary of rcov terms
+
+| Syntax | Structure | Parameters |
+|--------|-----------|------------|
+| `~ units` | $\sigma^2 \mathbf{I}$ | 1 |
+| `~ at(env):units` | $\text{diag}(\sigma^2_{e,1}, \ldots, \sigma^2_{e,k})$ | $k$ |
+
+---
+
+## Families and link functions
+
+bayesreml supports several response distributions via the `family` argument.
+
+### Supported families
+
+| `family` | Distribution | Default link | Typical use |
+|----------|-------------|--------------|-------------|
+| `"gaussian"` | Normal | identity | Continuous data (yield, height) |
+| `"binomial"` | Bernoulli/Binomial | logit | Binary or proportion data |
+| `"poisson"` | Poisson | log | Count data |
+| `"negative_binomial"` | Negative binomial | log | Overdispersed counts |
+| `"gamma"` | Gamma | log | Positive continuous, skewed |
+| `"beta"` | Beta | logit | Proportions in (0, 1) |
+
+### Overriding the link function
+
+The default link can be overridden with the `link` argument:
+
+```{r families}
+# Gaussian with identity link (default)
+fit <- bayesreml(yield ~ env, random = ~ geno, data = dat)
+
+# Binomial with logit link (default)
+fit <- bayesreml(
+  bin_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "binomial"
+)
+
+# Binomial with probit link
+fit <- bayesreml(
+  bin_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "binomial",
+  link   = "probit"
+)
+
+# Poisson with log link (default)
+fit <- bayesreml(
+  count_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "poisson"
+)
+
+# Negative binomial
+fit <- bayesreml(
+  count_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "negative_binomial"
+)
+
+# Gamma for positive continuous data
+fit <- bayesreml(
+  yield ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "gamma"
+)
+
+# Beta for proportion data
+fit <- bayesreml(
+  prop ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "beta"
+)
+```
+
+### The likelihood in mathematical notation
+
+For Gaussian models:
+$$y_i \mid \eta_i, \sigma^2_e \sim \text{Normal}(\eta_i, \sigma^2_e)$$
+
+For binomial models:
+$$y_i \mid p_i \sim \text{Bernoulli}(p_i), \quad
+g(p_i) = \eta_i$$
+
+where $g$ is the link function (logit or probit).
+
+---
+
+## `known_matrices` usage
+
+The `known_matrices` argument is a named list of pre-computed matrices. These are
+referenced by name inside `vm()` or `ped()` calls in the random formula.
+
+```{r known-matrices}
+# Prepare matrices
+G <- met_example$G_mat  # 10 x 10 genomic relationship matrix
+A <- met_example$A_mat  # 10 x 10 pedigree relationship matrix
+
+# Use in model
+fit <- bayesreml(
+  yield ~ env,
+  random         = ~ vm(geno, Gmat) + env:rep,
+  data           = dat,
+  known_matrices = list(Gmat = G)
+)
+
+# Multiple matrices
+fit <- bayesreml(
+  yield ~ env,
+  random         = ~ vm(geno, Gmat) + vm(geno, Amat),
+  data           = dat,
+  known_matrices = list(Gmat = G, Amat = A)
+)
+```
+
+**Requirements for known matrices:**
+
+- Must be symmetric and positive semi-definite
+- Row and column names must match the levels of the grouping factor
+- Dimensions must equal the number of unique levels
+
+---
+
+## Side-by-side: ASReml vs bayesreml syntax
+
+The table below shows ASReml R code on the left and the equivalent bayesreml
+call on the right. The formula syntax is intentionally as close as possible.
+
+### Simple random intercept
+
+```{r side-by-side-1}
+# ASReml
+# asreml(yield ~ env, random = ~ geno, data = dat)
+
+# bayesreml
+bayesreml(yield ~ env, random = ~ geno, data = dat)
+```
+
+### Nested random effects
+
+```{r side-by-side-2}
+# ASReml
+# asreml(yield ~ env, random = ~ geno + env:rep, data = dat)
+
+# bayesreml
+bayesreml(yield ~ env, random = ~ geno + env:rep, data = dat)
+```
+
+### GBLUP with genomic relationship matrix
+
+```{r side-by-side-3}
+# ASReml
+# asreml(yield ~ env, random = ~ vm(geno, source = Ginv),
+#        data = dat, ginverse = list(geno = Ginv))
+
+# bayesreml (uses the relationship matrix directly, not its inverse)
+bayesreml(
+  yield ~ env,
+  random         = ~ vm(geno, Gmat),
+  data           = dat,
+  known_matrices = list(Gmat = met_example$G_mat)
+)
+```
+
+Note: ASReml uses the **inverse** of the relationship matrix (`ginverse`);
+bayesreml uses the relationship matrix itself. bayesreml performs the Cholesky
+decomposition internally.
+
+### Heterogeneous variances across environments
+
+```{r side-by-side-4}
+# ASReml
+# asreml(yield ~ env, random = ~ at(env):geno,
+#        rcov = ~ at(env):units, data = dat)
+
+# bayesreml
+bayesreml(
+  yield ~ env,
+  random = ~ at(env):geno,
+  rcov   = ~ at(env):units,
+  data   = dat
+)
+```
+
+### Factor analytic model
+
+```{r side-by-side-5}
+# ASReml
+# asreml(yield ~ env, random = ~ fa(env, 1):geno, data = dat)
+
+# bayesreml
+bayesreml(yield ~ env, random = ~ fa(env, 1):geno, data = dat)
+```
+
+### Unstructured G x E
+
+```{r side-by-side-6}
+# ASReml
+# asreml(yield ~ env, random = ~ us(env):geno, data = dat)
+
+# bayesreml
+bayesreml(yield ~ env, random = ~ us(env):geno, data = dat)
+```
+
+### Non-Gaussian: binomial with probit link
+
+```{r side-by-side-7}
+# ASReml
+# asreml(bin_y ~ env, random = ~ geno, data = dat,
+#        family = asreml.binomial(link = "probit"))
+
+# bayesreml
+bayesreml(
+  bin_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "binomial",
+  link   = "probit"
+)
+```
+
+### Count data: Poisson
+
+```{r side-by-side-8}
+# ASReml
+# asreml(count_y ~ env, random = ~ geno, data = dat,
+#        family = asreml.poisson())
+
+# bayesreml
+bayesreml(
+  count_y ~ env,
+  random = ~ geno,
+  data   = dat,
+  family = "poisson"
+)
+```
+
+---
+
+## Tips and common pitfalls
+
+1. **Factor levels must match matrix dimensions.** When using `vm()`, ensure
+   that the factor in `data` has the same levels (and names) as the rows/columns
+   of the matrix in `known_matrices`.
+
+2. **bayesreml uses the relationship matrix, not its inverse.** ASReml requires
+   `ginverse`; bayesreml requires the original matrix. Do not invert.
+
+3. **Complex models need more samples.** Models with `us()` or `fa()` terms
+   have many parameters. Increase `n_samples` and `warmup` accordingly.
+
+4. **Centering continuous covariates helps.** HMC sampling is more efficient
+   when continuous predictors are centred and scaled.
+
+5. **Check the generated code.** Use `verbose = TRUE` (the default) or
+   `return_code = TRUE` to inspect what bayesreml is actually fitting. This
+   is especially helpful when debugging complex models.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

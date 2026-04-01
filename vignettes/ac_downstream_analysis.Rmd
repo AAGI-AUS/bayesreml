@@ -1,0 +1,470 @@
+---
+title: "Downstream Analysis: emmeans, marginaleffects, effectsize"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Downstream Analysis: emmeans, marginaleffects, effectsize}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Introduction
+
+One of bayesreml's key design goals is **seamless integration with the standard
+R modelling ecosystem**. Because the `$glm` component of every bayesreml fit
+inherits from `"glm"` and `"lm"`, packages like **emmeans**,
+**marginaleffects**, and **effectsize** work out of the box --- no special
+wrappers needed.
+
+This vignette demonstrates the full downstream workflow:
+
+1. Fit a model
+2. Inspect the summary
+3. Compute estimated marginal means with **emmeans**
+4. Compute marginal effects and predictions with **marginaleffects**
+5. Compute effect sizes with **effectsize**
+
+We also discuss the important conceptual difference between Bayesian **credible
+intervals** and frequentist **confidence intervals**.
+
+## Setup and model fitting
+
+We use the bundled `met_example` dataset and fit a model with environment as a
+fixed effect and genotype as a random effect:
+
+```{r fit-model}
+library(bayesreml)
+data(met_example)
+dat <- met_example$dat
+
+fit <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+```
+
+### Quick model check
+
+Always verify convergence before proceeding with downstream analysis:
+
+```{r convergence-check}
+# Print overview
+fit
+
+# Check Rhat and ESS
+fit$extras$convergence$gelman
+fit$extras$convergence$n_eff
+
+# Visual check
+plot(fit, type = "diagnostics")
+```
+
+### Model summary
+
+The `summary()` method provides fixed effects (posterior means and credible
+intervals), variance components, and convergence diagnostics:
+
+```{r summary}
+summary(fit)
+```
+
+---
+
+## emmeans: Estimated Marginal Means
+
+The [emmeans](https://cran.r-project.org/package=emmeans) package computes
+estimated marginal means (EMMs), pairwise comparisons, and contrasts. bayesreml
+provides `recover_data()` and `emm_basis()` methods, so emmeans integrates
+directly.
+
+### Computing EMMs
+
+```{r emmeans-basic}
+library(emmeans)
+
+# Estimated marginal means for each environment
+em <- emmeans(fit, ~ env)
+em
+```
+
+The output shows the posterior mean estimate for each environment level,
+averaged over genotype, along with standard errors and confidence/credible
+intervals.
+
+### Pairwise comparisons
+
+```{r emmeans-pairs}
+# All pairwise differences between environments
+pairs(em)
+```
+
+This produces all ${4 \choose 2} = 6$ pairwise contrasts with multiplicity
+adjustments (Tukey method by default).
+
+```{r emmeans-pairs-adjust}
+# Without multiplicity adjustment
+pairs(em, adjust = "none")
+
+# Bonferroni adjustment
+pairs(em, adjust = "bonferroni")
+```
+
+### Custom contrasts
+
+```{r emmeans-contrast}
+# Compare first environment to the average of the rest
+contrast(em, method = "trt.vs.ctrl")
+
+# Custom contrast: E1+E2 vs E3+E4
+contrast(em, method = list("E1E2 vs E3E4" = c(0.5, 0.5, -0.5, -0.5)))
+```
+
+### Interaction contrasts
+
+For models with interactions, emmeans can compute interaction contrasts:
+
+```{r emmeans-interaction}
+# Fit a model with a fixed interaction
+fit_int <- bayesreml(
+  yield ~ geno * env,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# Joint EMMs
+em_int <- emmeans(fit_int, ~ geno | env)
+em_int
+
+# Simple effects of genotype within each environment
+pairs(em_int)
+```
+
+### Plotting EMMs
+
+emmeans objects have a built-in `plot()` method:
+
+```{r emmeans-plot}
+# Dot plot with CIs
+plot(em) + ggplot2::theme_minimal()
+
+# Pairwise comparisons plot
+plot(pairs(em)) + ggplot2::theme_minimal()
+```
+
+### Compact letter display (CLD)
+
+```{r emmeans-cld}
+# Compact letter display for grouping
+library(multcomp)
+cld(em, Letters = letters)
+```
+
+---
+
+## marginaleffects: Marginal Effects and Predictions
+
+The [marginaleffects](https://marginaleffects.com/) package provides a unified
+interface for computing predictions, comparisons, and slopes. It works with
+bayesreml through the standard `coef()`, `vcov()`, and `predict()` methods.
+
+### Average marginal effects (slopes)
+
+For continuous predictors, `avg_slopes()` computes the average marginal effect
+(the average partial derivative of the expected response with respect to the
+predictor):
+
+```{r me-slopes}
+library(marginaleffects)
+
+# Fit a model with a continuous covariate
+fit_cov <- bayesreml(
+  yield ~ env + x_cov,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# Average marginal effect of x_cov
+avg_slopes(fit_cov, variables = "x_cov")
+```
+
+For factor predictors, `avg_slopes()` computes average contrasts between each
+level and the reference level:
+
+```{r me-slopes-factor}
+avg_slopes(fit_cov, variables = "env")
+```
+
+### Predictions
+
+`predictions()` computes predicted values at specific covariate values, useful
+for understanding the model at particular data points:
+
+```{r me-predictions}
+# Predictions at the observed data
+pred <- predictions(fit_cov)
+head(pred)
+
+# Predictions at a grid of values
+nd <- data.frame(
+  env   = factor(rep(c("E1", "E2", "E3", "E4"), each = 5)),
+  x_cov = rep(seq(-2, 2, length.out = 5), 4)
+)
+pred_grid <- predictions(fit_cov, newdata = nd)
+pred_grid
+```
+
+### Comparisons
+
+`avg_comparisons()` computes average contrasts for factor variables or unit
+changes for continuous variables:
+
+```{r me-comparisons}
+# Average comparison for env (each level vs reference)
+avg_comparisons(fit_cov, variables = "env")
+
+# Custom comparison: a 1-SD increase in x_cov
+avg_comparisons(fit_cov, variables = list(x_cov = "sd"))
+```
+
+### Plotting marginal effects
+
+```{r me-plot}
+# Plot predictions across environments
+plot_predictions(fit_cov, condition = "env")
+
+# Plot the slope of x_cov by environment
+plot_slopes(fit_cov, variables = "x_cov", condition = "env")
+```
+
+### Hypothesis tests
+
+marginaleffects can test specific hypotheses about marginal effects:
+
+```{r me-hypotheses}
+# Test if the slope of x_cov is different from zero
+slopes_out <- avg_slopes(fit_cov, variables = "x_cov")
+print(slopes_out)
+# The p-value and CI test H0: slope = 0
+```
+
+---
+
+## effectsize: Effect Size Measures
+
+The [effectsize](https://easystats.github.io/effectsize/) package computes
+standardised effect sizes from fitted models. It works with bayesreml's GLM
+interface.
+
+### Eta-squared
+
+Eta-squared ($\eta^2$) measures the proportion of variance explained by each
+term in the model. For Bayesian models, this is computed from the posterior
+mean estimates:
+
+```{r es-eta}
+library(effectsize)
+
+# Eta-squared for the fixed effects
+eta_squared(fit)
+```
+
+### Partial eta-squared
+
+```{r es-partial-eta}
+# Partial eta-squared
+eta_squared(fit, partial = TRUE)
+```
+
+### Omega-squared
+
+Omega-squared ($\omega^2$) is a less biased estimator of the proportion of
+variance explained:
+
+```{r es-omega}
+omega_squared(fit)
+```
+
+### Cohen's f
+
+Cohen's $f$ is related to $\eta^2$ by $f = \sqrt{\eta^2 / (1 - \eta^2)}$:
+
+```{r es-cohen}
+cohens_f(fit)
+```
+
+### Standardised coefficients
+
+```{r es-std}
+# Standardised regression coefficients
+standardize_parameters(fit)
+```
+
+### Interpreting effect sizes
+
+effectsize provides interpretation functions based on conventional benchmarks:
+
+```{r es-interpret}
+es <- eta_squared(fit)
+interpret_eta_squared(es$Eta2, rules = "cohen1988")
+```
+
+| Measure | Small | Medium | Large |
+|---------|-------|--------|-------|
+| $\eta^2$ | 0.01 | 0.06 | 0.14 |
+| Cohen's $f$ | 0.10 | 0.25 | 0.40 |
+
+---
+
+## Credible intervals vs confidence intervals
+
+When interpreting output from bayesreml, it is crucial to understand the
+difference between Bayesian **credible intervals** (CrIs) and frequentist
+**confidence intervals** (CIs).
+
+### Frequentist confidence interval
+
+A 95% CI means: "If we repeated this experiment many times and computed a CI
+each time, 95% of those intervals would contain the true parameter value."
+Critically, for any *specific* interval, we cannot say there is a 95%
+probability that the parameter lies within it.
+
+### Bayesian credible interval
+
+A 95% CrI means: "Given the observed data and our prior beliefs, there is a
+95% probability that the parameter lies within this interval." This is the
+more intuitive interpretation that most researchers actually want.
+
+### How bayesreml handles this
+
+bayesreml's `confint()` method returns posterior quantile-based credible
+intervals, not frequentist confidence intervals:
+
+```{r cri-example}
+# These are 95% credible intervals (posterior quantiles)
+confint(fit)
+#>              2.5%  97.5%
+#> (Intercept) 12.8  16.1
+#> envE2        1.2   5.4
+#> envE3        3.1   7.8
+#> envE4        5.5  10.2
+```
+
+When using **emmeans** or **marginaleffects** with a bayesreml fit, the reported
+intervals are derived from the posterior variance-covariance matrix. They
+approximate Bayesian credible intervals under a normal posterior assumption.
+
+### Practical implications
+
+For most well-identified models with reasonable sample sizes, CIs and CrIs
+will be numerically very similar. The differences become important when:
+
+- **Sample sizes are small**: Bayesian CrIs incorporate prior information and
+  tend to be more conservative (wider) than frequentist CIs.
+- **Parameters are near boundaries**: Variance components cannot be negative.
+  Bayesian posteriors naturally respect this constraint; REML confidence
+  intervals can include negative values.
+- **Models are complex**: With many variance components, Bayesian credible
+  intervals propagate all sources of uncertainty; frequentist SEs for variance
+  components are often approximate.
+
+---
+
+## Complete workflow example
+
+Here is a complete analysis workflow from model fitting to publication-ready
+results:
+
+```{r workflow}
+library(bayesreml)
+library(emmeans)
+library(marginaleffects)
+library(effectsize)
+library(ggplot2)
+
+# 1. Load data
+data(met_example)
+dat <- met_example$dat
+
+# 2. Fit model
+fit <- bayesreml(
+  yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# 3. Verify convergence
+fit
+plot(fit, type = "diagnostics")
+
+# 4. Model summary
+summary(fit)
+
+# 5. Fixed effects with credible intervals
+coef(fit)
+confint(fit)
+plot(fit, type = "effects")
+
+# 6. Variance components
+fit$extras$variance_comps
+plot(fit, type = "variance")
+
+# 7. Estimated marginal means
+em <- emmeans(fit, ~ env)
+pairs(em)
+plot(em)
+
+# 8. Effect sizes
+eta_squared(fit)
+
+# 9. Predictions at new data
+nd <- expand.grid(env = levels(dat$env))
+predictions(fit, newdata = nd)
+
+# 10. BLUPs (genotype rankings)
+fit$extras$blups$geno
+plot(fit, type = "blups")
+```
+
+## Tips for downstream analysis
+
+1. **Always check convergence first.** Downstream analyses based on a model
+   that has not converged are meaningless.
+
+2. **Use `$glm` for emmeans/marginaleffects.** These packages dispatch on the
+   `$glm` component automatically when you pass the bayesreml object.
+
+3. **For full Bayesian inference**, work with `fit$greta$draws` directly.
+   The point-estimate approach through emmeans/marginaleffects uses the
+   posterior mean and variance-covariance matrix, which is an approximation.
+
+4. **Large models may need more samples.** If credible intervals seem too wide
+   or ESS is low, increase `n_samples`.
+
+5. **emmeans respects the parameterisation.** If you fit with an intercept,
+   emmeans uses treatment contrasts. If you fit without (`- 1`), it uses the
+   cell-means parameterisation. Choose based on your analysis goals.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

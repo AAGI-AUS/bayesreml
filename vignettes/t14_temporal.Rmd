@@ -1,0 +1,678 @@
+---
+title: "Tutorial 14: Temporal Correlation Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 14: Temporal Correlation Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Repeated measures over time often violate the independence assumption: adjacent
+time points are more correlated than distant ones. Temporal correlation
+structures model this pattern explicitly, improving both inference and
+prediction.
+
+This tutorial demonstrates four temporal correlation structures using
+`nlme::BodyWeight`, which records rat body weights across 3 diets, 16 rats,
+and 11 time points.
+
+**Models covered:**
+
+| Model | Structure | Correlation pattern |
+|-------|-----------|---------------------|
+| m_14a | AR(1) | Exponentially decaying: $\rho^{|t_i - t_j|}$ |
+| m_14b | Toeplitz | Separate correlation for each lag |
+| m_14c | MA(1) | Only adjacent times correlated |
+| m_14d | ARMA(1,1) | Combined autoregressive + moving average |
+
+**Packages required:**
+
+```{r packages}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(nlme)
+library(bayesplot)
+library(patchwork)
+```
+
+---
+
+## 1. Data preparation
+
+### BodyWeight data
+
+```{r data-load}
+data(BodyWeight, package = "nlme")
+bw <- as.data.frame(BodyWeight)
+bw$Rat  <- factor(bw$Rat)
+bw$Diet <- factor(bw$Diet)
+bw$Time <- as.numeric(bw$Time)
+
+# Create a time index (1, 2, ..., 11) for correlation structures
+bw <- bw %>%
+  group_by(Rat) %>%
+  mutate(time_idx = as.integer(factor(Time))) %>%
+  ungroup()
+
+str(bw)
+cat("Rats:", nlevels(bw$Rat), "\n")
+cat("Time points:", length(unique(bw$Time)), "\n")
+cat("Diets:", nlevels(bw$Diet), "\n")
+```
+
+### Exploratory plots
+
+```{r eda-spaghetti, fig.height = 5}
+ggplot(bw, aes(x = Time, y = weight, group = Rat, colour = Diet)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 1) +
+  facet_wrap(~ Diet, labeller = label_both) +
+  labs(title = "Rat body weight over time by diet",
+       x = "Time (days)", y = "Body weight (g)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+### Raw residual ACF
+
+The autocorrelation function (ACF) of residuals from a naive model reveals
+temporal correlation:
+
+```{r acf-raw, fig.height = 4}
+# Fit a naive model ignoring temporal correlation
+naive_fit <- lm(weight ~ Diet * Time, data = bw)
+bw$resid_naive <- residuals(naive_fit)
+
+# Per-rat ACF
+acf_data <- bw %>%
+  group_by(Rat) %>%
+  summarise(
+    acf_vals = list(acf(resid_naive, plot = FALSE, lag.max = 10)$acf[-1]),
+    .groups = "drop"
+  ) %>%
+  mutate(acf_vals = lapply(acf_vals, function(x)
+    data.frame(lag = seq_along(x), acf = as.numeric(x)))) %>%
+  tidyr::unnest(acf_vals)
+
+acf_mean <- acf_data %>%
+  group_by(lag) %>%
+  summarise(mean_acf = mean(acf), .groups = "drop")
+
+ggplot(acf_data, aes(x = lag, y = acf, group = Rat)) +
+  geom_line(alpha = 0.3, colour = "grey50") +
+  geom_line(data = acf_mean, aes(x = lag, y = mean_acf, group = 1),
+            colour = "firebrick", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "ACF of naive residuals (per rat, red = mean)",
+       x = "Lag", y = "Autocorrelation") +
+  theme_minimal()
+```
+
+Strong positive autocorrelation at lag 1 that decays over subsequent lags is
+the hallmark of AR(1)-type temporal correlation.
+
+---
+
+## 2. Constructing temporal correlation matrices
+
+Temporal correlation matrices are constructed from the time structure and
+passed to `bayesreml` via `known_matrices`. Each matrix encodes a different
+assumption about how correlation decays with temporal distance.
+
+### AR(1) correlation matrix
+
+The AR(1) correlation matrix has entries:
+
+$$
+R_{ij} = \rho^{|t_i - t_j|}
+$$
+
+where $\rho \in (-1, 1)$ is the autocorrelation parameter. Since $\rho$ is
+unknown, we fix a plausible value (estimated from the ACF) and let `bayesreml`
+estimate the variance scaling.
+
+```{r ar1-matrix}
+make_ar1 <- function(n_time, rho) {
+  R <- matrix(0, n_time, n_time)
+  for (i in seq_len(n_time)) {
+    for (j in seq_len(n_time)) {
+      R[i, j] <- rho^abs(i - j)
+    }
+  }
+  return(R)
+}
+
+n_time <- 11
+rho_hat <- acf_mean$mean_acf[1]  # lag-1 ACF as initial estimate
+cat("Estimated AR(1) rho:", round(rho_hat, 3), "\n")
+
+R_ar1 <- make_ar1(n_time, rho = rho_hat)
+```
+
+### Toeplitz correlation matrix
+
+The Toeplitz structure assigns a separate parameter for each lag:
+
+$$
+R_{ij} = \rho_{|t_i - t_j|}
+$$
+
+This is more flexible than AR(1) --- it does not enforce exponential decay.
+
+```{r toeplitz-matrix}
+make_toeplitz <- function(rho_vec) {
+  n <- length(rho_vec) + 1
+  R <- diag(n)
+  for (lag in seq_along(rho_vec)) {
+    for (i in seq_len(n - lag)) {
+      R[i, i + lag] <- rho_vec[lag]
+      R[i + lag, i] <- rho_vec[lag]
+    }
+  }
+  # Ensure positive definiteness
+  R <- as.matrix(Matrix::nearPD(R)$mat)
+  return(R)
+}
+
+# Use the mean ACF values as lag-specific correlations
+rho_toep <- acf_mean$mean_acf[1:min(10, nrow(acf_mean))]
+R_toep <- make_toeplitz(rho_toep)
+```
+
+### MA(1) correlation matrix
+
+The moving average (MA(1)) structure assumes that only adjacent time points
+share correlation through a common shock:
+
+$$
+R_{ij} = \begin{cases}
+  1 & \text{if } |t_i - t_j| = 0 \\
+  \theta / (1 + \theta^2) & \text{if } |t_i - t_j| = 1 \\
+  0 & \text{otherwise}
+\end{cases}
+$$
+
+```{r ma1-matrix}
+make_ma1 <- function(n_time, theta) {
+  rho1 <- theta / (1 + theta^2)
+  R <- diag(n_time)
+  for (i in seq_len(n_time - 1)) {
+    R[i, i + 1] <- rho1
+    R[i + 1, i] <- rho1
+  }
+  return(R)
+}
+
+R_ma1 <- make_ma1(n_time, theta = 0.7)
+```
+
+### ARMA(1,1) correlation matrix
+
+The ARMA(1,1) combines AR and MA components:
+
+$$
+R_{ij} = \begin{cases}
+  1 & \text{if } |t_i - t_j| = 0 \\
+  \frac{(1 + \phi\theta)(\phi + \theta)}{1 + 2\phi\theta + \theta^2} \cdot \phi^{|t_i - t_j| - 1}
+  & \text{if } |t_i - t_j| \geq 1
+\end{cases}
+$$
+
+```{r arma11-matrix}
+make_arma11 <- function(n_time, phi, theta) {
+  rho1 <- (1 + phi * theta) * (phi + theta) / (1 + 2 * phi * theta + theta^2)
+  R <- diag(n_time)
+  for (i in seq_len(n_time)) {
+    for (j in seq_len(n_time)) {
+      lag <- abs(i - j)
+      if (lag == 1) {
+        R[i, j] <- rho1
+      } else if (lag > 1) {
+        R[i, j] <- rho1 * phi^(lag - 1)
+      }
+    }
+  }
+  R <- as.matrix(Matrix::nearPD(R)$mat)
+  return(R)
+}
+
+R_arma <- make_arma11(n_time, phi = 0.8, theta = 0.3)
+```
+
+### Expanding to full data dimensions
+
+The correlation matrices above are $T \times T$ (11 x 11). For `bayesreml`,
+we need a block-diagonal matrix where each rat gets its own copy:
+
+```{r block-expand}
+make_block_diag <- function(R_base, group_factor) {
+  groups <- levels(group_factor)
+  n_total <- length(group_factor)
+  R_full <- matrix(0, n_total, n_total)
+
+  for (g in groups) {
+    idx <- which(group_factor == g)
+    n_g <- length(idx)
+    # Handle cases where a rat may have fewer observations
+    R_sub <- R_base[seq_len(n_g), seq_len(n_g)]
+    R_full[idx, idx] <- R_sub
+  }
+  return(R_full)
+}
+
+# Create observation-level ID
+bw$obs_id <- factor(seq_len(nrow(bw)))
+
+# Ensure data is ordered by Rat and time_idx
+bw <- bw[order(bw$Rat, bw$time_idx), ]
+bw$obs_id <- factor(seq_len(nrow(bw)))
+
+R_ar1_full  <- make_block_diag(R_ar1,  bw$Rat)
+R_toep_full <- make_block_diag(R_toep, bw$Rat)
+R_ma1_full  <- make_block_diag(R_ma1,  bw$Rat)
+R_arma_full <- make_block_diag(R_arma, bw$Rat)
+```
+
+---
+
+## 3. Model 14a: AR(1) temporal correlation
+
+### Mathematical formulation
+
+$$
+y_{ijk} = \mu + \alpha_j + \beta \cdot t_k + (\alpha\beta)_{jk} + u_i
+          + w_{ik} + \varepsilon_{ijk}
+$$
+
+where $u_i \sim \mathcal{N}(0, \sigma_u^2)$ is the random rat intercept and
+$\mathbf{w}_i \sim \mathcal{N}(\mathbf{0}, \sigma_w^2 \mathbf{R}_{\text{AR1}})$
+captures the temporal correlation.
+
+### Fitting
+
+```{r m14a-fit}
+m_14a <- bayesreml(
+  fixed          = weight ~ Diet * Time,
+  random         = ~ Rat + vm(obs_id, Rar1),
+  data           = bw,
+  known_matrices = list(Rar1 = R_ar1_full),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_14a)
+```
+
+### Diagnostics
+
+```{r m14a-diag, fig.height = 6}
+plot(m_14a, type = "diagnostics")
+```
+
+### ACF of corrected residuals
+
+```{r m14a-acf, fig.height = 4}
+bw$resid_14a <- residuals(m_14a)
+
+acf_corrected <- bw %>%
+  group_by(Rat) %>%
+  summarise(
+    acf_vals = list(acf(resid_14a, plot = FALSE, lag.max = 10)$acf[-1]),
+    .groups = "drop"
+  ) %>%
+  mutate(acf_vals = lapply(acf_vals, function(x)
+    data.frame(lag = seq_along(x), acf = as.numeric(x)))) %>%
+  tidyr::unnest(acf_vals)
+
+acf_corr_mean <- acf_corrected %>%
+  group_by(lag) %>%
+  summarise(mean_acf = mean(acf), .groups = "drop")
+
+# Compare raw and corrected ACFs
+acf_compare <- bind_rows(
+  acf_mean %>% mutate(model = "Naive (no temporal)"),
+  acf_corr_mean %>% mutate(model = "AR(1) corrected")
+)
+
+ggplot(acf_compare, aes(x = lag, y = mean_acf, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = c(-1.96, 1.96) / sqrt(11),
+             linetype = "dotted", colour = "grey50") +
+  labs(title = "Mean ACF: naive vs AR(1)-corrected residuals",
+       x = "Lag", y = "Autocorrelation", colour = "Model") +
+  theme_minimal()
+```
+
+If the AR(1) model adequately captures the temporal correlation, the corrected
+residuals should show no significant autocorrelation (all ACF values within the
+dashed 95% bounds).
+
+### AR(1) parameter interpretation
+
+The AR(1) parameter $\rho$ controls the rate of correlation decay:
+
+$$
+\text{Cor}(y_t, y_{t+k}) = \rho^k
+$$
+
+```{r m14a-decay, fig.height = 4}
+# Correlation decay plot
+lags <- 0:10
+decay_df <- data.frame(
+  lag = lags,
+  correlation = rho_hat^lags
+)
+
+ggplot(decay_df, aes(x = lag, y = correlation)) +
+  geom_line(colour = "steelblue", linewidth = 1) +
+  geom_point(colour = "steelblue", size = 2.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  annotate("text", x = 5, y = 0.5,
+           label = paste0("rho = ", round(rho_hat, 3)),
+           colour = "steelblue", size = 5) +
+  labs(title = "AR(1) correlation decay",
+       subtitle = "Correlation halves every log(2)/log(rho) lags",
+       x = "Lag (time steps)", y = "Correlation") +
+  theme_minimal()
+
+half_life <- log(2) / (-log(abs(rho_hat)))
+cat("Correlation half-life:", round(half_life, 2), "time steps\n")
+```
+
+### Spaghetti plot with fitted lines
+
+```{r m14a-spaghetti, fig.height = 5}
+bw$fitted_14a <- fitted(m_14a)
+
+ggplot(bw, aes(x = Time, group = Rat)) +
+  geom_point(aes(y = weight), alpha = 0.3, size = 1, colour = "grey40") +
+  geom_line(aes(y = fitted_14a, colour = Diet), linewidth = 0.6, alpha = 0.7) +
+  facet_wrap(~ Diet, labeller = label_both) +
+  labs(title = "Model 14a: AR(1) fitted trajectories",
+       x = "Time (days)", y = "Body weight (g)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+---
+
+## 4. Model 14b: Toeplitz structure
+
+```{r m14b-fit}
+m_14b <- bayesreml(
+  fixed          = weight ~ Diet * Time,
+  random         = ~ Rat + vm(obs_id, Rtoep),
+  data           = bw,
+  known_matrices = list(Rtoep = R_toep_full),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_14b)
+```
+
+### Toeplitz lag-specific correlations
+
+```{r m14b-lags, fig.height = 4}
+# The Toeplitz structure uses separate rho for each lag
+toep_df <- data.frame(
+  lag = seq_along(rho_toep),
+  correlation = rho_toep,
+  ar1_comparison = rho_hat^seq_along(rho_toep)
+)
+
+toep_long <- toep_df %>%
+  pivot_longer(cols = c(correlation, ar1_comparison),
+               names_to = "structure", values_to = "rho") %>%
+  mutate(structure = recode(structure,
+    correlation    = "Toeplitz (observed)",
+    ar1_comparison = "AR(1) (fitted)"
+  ))
+
+ggplot(toep_long, aes(x = lag, y = rho, colour = structure)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Toeplitz vs AR(1): lag-specific correlations",
+       subtitle = "Deviations from the AR(1) line indicate non-exponential decay",
+       x = "Lag", y = "Correlation", colour = "") +
+  theme_minimal()
+```
+
+If the Toeplitz correlations closely follow the AR(1) curve, the simpler AR(1)
+model is sufficient. Deviations suggest the true correlation structure is more
+complex.
+
+---
+
+## 5. Model 14c: MA(1) structure
+
+```{r m14c-fit}
+m_14c <- bayesreml(
+  fixed          = weight ~ Diet * Time,
+  random         = ~ Rat + vm(obs_id, Rma1),
+  data           = bw,
+  known_matrices = list(Rma1 = R_ma1_full),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_14c)
+```
+
+The MA(1) model implies that the correlation drops to zero after lag 1. This is
+rarely appropriate for growth data where correlation persists across many lags.
+
+---
+
+## 6. Model 14d: ARMA(1,1) structure
+
+```{r m14d-fit}
+m_14d <- bayesreml(
+  fixed          = weight ~ Diet * Time,
+  random         = ~ Rat + vm(obs_id, Rarma),
+  data           = bw,
+  known_matrices = list(Rarma = R_arma_full),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_14d)
+```
+
+---
+
+## 7. Structure comparison
+
+### Model comparison via DIC
+
+```{r compare-dic}
+anova(m_14a, m_14b, m_14c, m_14d)
+```
+
+### ACF comparison across models
+
+```{r compare-acf, fig.height = 6}
+bw$resid_14b <- residuals(m_14b)
+bw$resid_14c <- residuals(m_14c)
+bw$resid_14d <- residuals(m_14d)
+
+compute_mean_acf <- function(data, resid_col, model_name) {
+  data %>%
+    group_by(Rat) %>%
+    summarise(
+      acf_vals = list(acf(.data[[resid_col]], plot = FALSE,
+                          lag.max = 10)$acf[-1]),
+      .groups = "drop"
+    ) %>%
+    mutate(acf_vals = lapply(acf_vals, function(x)
+      data.frame(lag = seq_along(x), acf = as.numeric(x)))) %>%
+    tidyr::unnest(acf_vals) %>%
+    group_by(lag) %>%
+    summarise(mean_acf = mean(acf), .groups = "drop") %>%
+    mutate(model = model_name)
+}
+
+acf_all <- bind_rows(
+  acf_mean %>% mutate(model = "Naive"),
+  compute_mean_acf(bw, "resid_14a", "AR(1)"),
+  compute_mean_acf(bw, "resid_14b", "Toeplitz"),
+  compute_mean_acf(bw, "resid_14c", "MA(1)"),
+  compute_mean_acf(bw, "resid_14d", "ARMA(1,1)")
+)
+
+ggplot(acf_all, aes(x = lag, y = mean_acf, colour = model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = c(-1.96, 1.96) / sqrt(11),
+             linetype = "dotted", colour = "grey50") +
+  labs(title = "Residual ACF comparison across temporal structures",
+       x = "Lag", y = "Mean autocorrelation", colour = "Model") +
+  theme_minimal()
+```
+
+### Time-series prediction with credible bands
+
+```{r predict-bands, fig.height = 5}
+# Population-level prediction for Diet 1
+new_time <- data.frame(
+  Diet = factor(1, levels = levels(bw$Diet)),
+  Time = seq(min(bw$Time), max(bw$Time) * 1.2, length.out = 50)
+)
+
+pred_14a <- predict(m_14a, newdata = new_time, se.fit = TRUE)
+new_time$fit   <- pred_14a$fit
+new_time$lower <- pred_14a$fit - 1.96 * pred_14a$se.fit
+new_time$upper <- pred_14a$fit + 1.96 * pred_14a$se.fit
+
+ggplot() +
+  geom_ribbon(data = new_time, aes(x = Time, ymin = lower, ymax = upper),
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(data = new_time, aes(x = Time, y = fit),
+            colour = "steelblue", linewidth = 1.2) +
+  geom_point(data = bw[bw$Diet == 1, ], aes(x = Time, y = weight),
+             alpha = 0.3, size = 1) +
+  geom_vline(xintercept = max(bw$Time), linetype = "dashed",
+             colour = "red", alpha = 0.5) +
+  annotate("text", x = max(bw$Time) * 1.05, y = max(bw$weight) * 0.9,
+           label = "extrapolation", colour = "red", size = 3.5) +
+  labs(title = "AR(1) model: prediction with 95% credible band",
+       subtitle = "Diet 1, population-level (random effects integrated out)",
+       x = "Time (days)", y = "Body weight (g)") +
+  theme_minimal()
+```
+
+### Comparison with nlme
+
+```{r compare-nlme}
+lme_ar1 <- lme(weight ~ Diet * Time, random = ~ 1 | Rat,
+               correlation = corAR1(form = ~ time_idx | Rat),
+               data = bw)
+summary(lme_ar1)
+
+# Compare fixed effects
+data.frame(
+  Parameter = names(coef(m_14a)),
+  bayesreml = round(coef(m_14a), 3),
+  nlme      = round(fixef(lme_ar1), 3)
+)
+
+# Compare AR(1) parameter
+intervals(lme_ar1, which = "var-cov")$corStruct
+cat("bayesreml AR(1) rho (input):", round(rho_hat, 3), "\n")
+```
+
+---
+
+## 8. ACF diagnostic chart
+
+A comprehensive ACF diagnostic panel:
+
+```{r acf-panel, fig.height = 7}
+# Per-rat ACF for the best model
+best_resid <- "resid_14a"  # change based on model comparison results
+
+acf_per_rat <- bw %>%
+  group_by(Rat, Diet) %>%
+  summarise(
+    acf_vals = list(acf(.data[[best_resid]], plot = FALSE,
+                        lag.max = 8)$acf[-1]),
+    .groups = "drop"
+  ) %>%
+  mutate(acf_vals = lapply(acf_vals, function(x)
+    data.frame(lag = seq_along(x), acf = as.numeric(x)))) %>%
+  tidyr::unnest(acf_vals)
+
+ggplot(acf_per_rat, aes(x = lag, y = acf)) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = c(-1.96, 1.96) / sqrt(11),
+             linetype = "dashed", colour = "red") +
+  facet_wrap(~ Rat, ncol = 4) +
+  labs(title = "Per-rat ACF of AR(1)-corrected residuals",
+       subtitle = "Bars outside dashed lines indicate residual autocorrelation",
+       x = "Lag", y = "ACF") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8))
+```
+
+---
+
+## 9. Key takeaways
+
+1. **Inspect the ACF before and after fitting.** The raw residual ACF motivates
+   the choice of temporal structure. The corrected residual ACF validates that
+   the chosen structure is adequate.
+
+2. **AR(1) is the default starting point** for longitudinal data with regularly
+   spaced time points. Its single parameter ($\rho$) is interpretable as the
+   correlation between adjacent measurements.
+
+3. **Toeplitz is a diagnostic tool.** If the Toeplitz lag-specific correlations
+   closely follow the AR(1) exponential decay, the simpler model suffices.
+
+4. **MA(1) is rarely sufficient** for growth data because it implies zero
+   correlation beyond lag 1. It is more appropriate for processes driven by
+   transient shocks.
+
+5. **ARMA(1,1) combines both mechanisms** and can capture correlation patterns
+   that neither AR(1) nor MA(1) alone can model. The extra parameter must be
+   justified by model comparison.
+
+6. **Temporal correlation matrices must be block-diagonal** when subjects are
+   independent. Each subject gets its own $T \times T$ block within the
+   $N \times N$ full matrix.
+
+7. **Extrapolation** beyond the observed time range is risky. The credible
+   bands widen dramatically, reflecting increasing uncertainty.
+
+### Inspect the generated code
+
+```{r show-code}
+cat(m_14a$extras$code)
+```
+
+---
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

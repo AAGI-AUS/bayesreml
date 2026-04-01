@@ -1,0 +1,593 @@
+---
+title: "Working with Native Greta Output"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Working with Native Greta Output}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Introduction
+
+While bayesreml's `$glm` component provides a convenient interface to the
+standard R modelling ecosystem, the `$greta` component gives you access to the
+full power of Bayesian posterior inference. This vignette covers:
+
+1. Understanding the `$greta` component
+2. Working with MCMC draws directly
+3. Computing derived quantities with `greta::calculate()`
+4. Drawing additional samples with `greta::extra_samples()`
+5. Converting to modern posterior formats
+6. Creating publication-quality diagnostic plots with **bayesplot**
+
+This vignette is for users who want to go beyond point estimates and fully
+exploit the posterior distribution.
+
+## The `$greta` component
+
+Every bayesreml fit contains a `$greta` component of class `"bayesreml_greta"`
+with four elements:
+
+```{r greta-structure}
+library(bayesreml)
+data(met_example)
+dat <- met_example$dat
+
+fit <- bayesreml(
+  yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# Inspect the structure
+names(fit$greta)
+#> [1] "model"        "draws"        "greta_arrays" "env"
+```
+
+| Element | Class | Description |
+|---------|-------|-------------|
+| `$model` | `greta_model` | The compiled greta model object |
+| `$draws` | `mcmc.list` | MCMC draws from all chains (coda format) |
+| `$greta_arrays` | Named list | All greta array objects created during fitting |
+| `$env` | `environment` | The evaluation environment with all objects |
+
+---
+
+## Working with MCMC draws
+
+### The `mcmc.list` object
+
+The draws are stored as a `coda::mcmc.list`, the standard R format for MCMC
+output. Each element of the list is one chain:
+
+```{r draws-basics}
+draws <- fit$greta$draws
+
+# Number of chains
+length(draws)
+#> [1] 4
+
+# Dimensions of one chain (iterations x parameters)
+dim(draws[[1]])
+
+# Parameter names
+colnames(draws[[1]])
+
+# First few rows of chain 1
+head(as.matrix(draws[[1]]))
+```
+
+### Extracting specific parameters
+
+```{r draws-extract}
+# All draws as a single matrix (all chains combined)
+all_draws <- do.call(rbind, lapply(draws, as.matrix))
+dim(all_draws)
+#> [1] 8000   15  (2000 samples x 4 chains, 15 parameters)
+
+# Extract draws for the intercept
+mu_draws <- all_draws[, "mu_atg"]
+mean(mu_draws)
+quantile(mu_draws, c(0.025, 0.5, 0.975))
+
+# Extract draws for a variance component
+sigma_geno_draws <- all_draws[, "sigma_geno_atg"]
+mean(sigma_geno_draws)
+```
+
+### Computing posterior summaries manually
+
+```{r draws-summaries}
+# Posterior mean and SD for all parameters
+param_means <- colMeans(all_draws)
+param_sds   <- apply(all_draws, 2, sd)
+
+# 95% credible intervals for all parameters
+param_cri <- t(apply(all_draws, 2, quantile, probs = c(0.025, 0.975)))
+
+# Combine into a summary table
+post_summary <- data.frame(
+  mean   = param_means,
+  sd     = param_sds,
+  q2.5   = param_cri[, 1],
+  q97.5  = param_cri[, 2]
+)
+print(round(post_summary, 4))
+```
+
+### Probability statements
+
+One of the great advantages of Bayesian inference is that you can make direct
+probability statements about parameters:
+
+```{r prob-statements}
+# Probability that environment E2 effect is positive
+tau_E2 <- all_draws[, "tau_envE2"]
+mean(tau_E2 > 0)
+#> [1] 0.998
+
+# Probability that genotype variance > 2
+sigma_g <- all_draws[, "sigma_geno_atg"]
+mean(sigma_g^2 > 2)
+#> [1] 0.87
+
+# Probability that E3 effect > E2 effect
+tau_E3 <- all_draws[, "tau_envE3"]
+mean(tau_E3 > tau_E2)
+#> [1] 0.72
+```
+
+---
+
+## Computing derived quantities with `greta::calculate()`
+
+`greta::calculate()` is one of greta's most powerful features. It lets you
+compute posterior distributions for *any function* of the model parameters,
+even quantities that were not explicitly monitored during sampling.
+
+### Basic usage
+
+```{r calculate-basic}
+library(greta)
+
+# Access greta arrays
+ga <- fit$greta$greta_arrays
+names(ga)
+
+# Compute the ratio of genotype variance to total variance (heritability)
+# First, find the relevant greta arrays
+sigma_g <- ga$sigma_geno_atg
+sigma_e <- ga$sigma_e_atg
+
+# Define a derived quantity
+heritability <- sigma_g^2 / (sigma_g^2 + sigma_e^2)
+
+# Calculate its posterior distribution using the existing draws
+h2_draws <- calculate(heritability, values = draws)
+
+# Summarise
+h2_matrix <- as.matrix(h2_draws)
+mean(h2_matrix)
+quantile(h2_matrix, c(0.025, 0.5, 0.975))
+```
+
+### Multiple derived quantities
+
+```{r calculate-multiple}
+# Coefficient of variation for genotype
+cv_geno <- sigma_g / abs(ga$mu_atg) * 100
+
+# Signal-to-noise ratio
+snr <- sigma_g^2 / sigma_e^2
+
+# Calculate both at once
+derived <- calculate(cv_geno, snr, values = draws)
+```
+
+### Predictions for new observations
+
+`greta::calculate()` can also compute predictions at new covariate values by
+constructing the linear predictor from greta arrays:
+
+```{r calculate-predictions}
+# Predict yield at E1 for a "new" genotype (random effect = 0)
+# The linear predictor for E1 is just the intercept (E1 is the reference)
+mu <- ga$mu_atg
+
+# Posterior predictive distribution (including residual uncertainty)
+y_pred <- normal(mu, sigma_e)
+y_pred_draws <- calculate(y_pred, values = draws, nsim = 1)
+```
+
+---
+
+## Drawing additional samples with `greta::extra_samples()`
+
+If you determine that you need more posterior samples (e.g., because ESS is too
+low), you do not need to restart from scratch. `greta::extra_samples()` extends
+the existing chains:
+
+```{r extra-samples}
+# Original draws: 2000 per chain
+dim(draws[[1]])
+#> [1] 2000   15
+
+# Draw 3000 more samples per chain (no additional warmup needed)
+draws_extended <- extra_samples(
+  fit$greta$model,
+  draws,
+  n_samples = 3000,
+  verbose   = TRUE
+)
+
+# Now we have 5000 per chain
+dim(draws_extended[[1]])
+#> [1] 5000   15
+```
+
+This is much faster than refitting because the HMC tuning parameters (step
+size, mass matrix) are retained from the original warmup.
+
+### When to use `extra_samples()`
+
+- ESS is below the desired threshold (e.g., < 400 per parameter)
+- You want higher precision for tail probabilities (e.g., for LOO-CV)
+- You are computing derived quantities and need a smooth posterior
+
+---
+
+## Converting to modern posterior formats
+
+The [posterior](https://mc-stan.org/posterior/) package provides a modern,
+tidy interface to MCMC draws with richer diagnostics than coda.
+
+### Converting to `draws_df`
+
+```{r posterior-df}
+library(posterior)
+
+# Convert from coda::mcmc.list to posterior::draws_df
+post_draws <- as_draws_df(draws)
+print(post_draws)
+
+# Tidy summary with ESS and Rhat
+summarise_draws(post_draws)
+```
+
+The `draws_df` format is a data frame with one row per draw, columns for each
+parameter, plus `.chain`, `.iteration`, and `.draw` columns.
+
+### Converting to other formats
+
+```{r posterior-formats}
+# draws_array: 3D array (iteration x chain x variable)
+post_array <- as_draws_array(draws)
+dim(post_array)
+
+# draws_matrix: 2D matrix (draw x variable), chains merged
+post_matrix <- as_draws_matrix(draws)
+dim(post_matrix)
+
+# draws_rvars: random variable representation
+post_rvars <- as_draws_rvars(draws)
+post_rvars$mu_atg
+```
+
+### Advanced diagnostics with posterior
+
+```{r posterior-diagnostics}
+# Bulk and tail ESS (more informative than basic ESS)
+summarise_draws(post_draws, measure = c("mean", "sd", "ess_bulk", "ess_tail",
+                                         "rhat"))
+
+# Autocovariance
+post_draws |>
+  subset_draws(variable = "mu_atg") |>
+  summarise_draws(
+    mean,
+    sd,
+    ess_bulk,
+    ess_tail,
+    rhat
+  )
+```
+
+### Subsetting and manipulating draws
+
+```{r posterior-subset}
+# Keep only variance components
+vc_draws <- subset_draws(post_draws, variable = "sigma")
+
+# Thin to every 5th draw
+thin_draws <- thin_draws(post_draws, thin = 5)
+
+# Merge two sets of draws
+# (e.g., after extra_samples)
+```
+
+---
+
+## bayesplot diagnostic gallery
+
+The [bayesplot](https://mc-stan.org/bayesplot/) package provides a comprehensive
+set of MCMC diagnostic plots built on ggplot2. All bayesplot functions accept
+`mcmc.list` objects directly.
+
+### Trace plots
+
+Trace plots show the sampled values across iterations for each chain. Healthy
+traces look like "hairy caterpillars" with no trends or stuck regions.
+
+```{r bp-trace}
+library(bayesplot)
+library(ggplot2)
+
+# Trace plots for all parameters
+mcmc_trace(draws)
+
+# Trace plots for specific parameters
+mcmc_trace(draws, pars = c("mu_atg", "sigma_geno_atg", "sigma_e_atg"))
+
+# Trace plot with divergence highlighting (if available)
+mcmc_trace(draws, pars = "mu_atg") +
+  labs(title = "Trace plot: Intercept")
+```
+
+### Density and interval plots
+
+```{r bp-density}
+# Density plots overlaid by chain
+mcmc_dens_overlay(draws, pars = c("mu_atg", "tau_envE2", "tau_envE3"))
+
+# Ridgeline density plots
+mcmc_dens(draws, pars = c("mu_atg", "tau_envE2", "tau_envE3", "tau_envE4"))
+
+# Posterior intervals (80% and 95%)
+mcmc_intervals(draws, pars = c("mu_atg", "tau_envE2", "tau_envE3", "tau_envE4"))
+
+# Areas plot (shaded density with intervals)
+mcmc_areas(draws,
+           pars = c("mu_atg", "tau_envE2", "tau_envE3", "tau_envE4"),
+           prob = 0.95,
+           prob_outer = 0.99) +
+  labs(title = "Posterior distributions (95% and 99% intervals)")
+```
+
+### Pairs plots
+
+Pairs plots reveal correlations between parameters in the posterior. Strong
+correlations can indicate parameterisation problems.
+
+```{r bp-pairs}
+# Pairs plot for selected parameters
+mcmc_pairs(draws,
+           pars = c("mu_atg", "sigma_geno_atg", "sigma_e_atg"),
+           off_diag_fun = "hex")
+```
+
+### Autocorrelation
+
+High autocorrelation means low effective sample size. Ideally, autocorrelation
+should drop to near zero within a few lags.
+
+```{r bp-acf}
+# Autocorrelation plots
+mcmc_acf(draws, pars = c("mu_atg", "sigma_geno_atg"))
+```
+
+### Rank plots (trank plots)
+
+Rank plots are a modern diagnostic that is more sensitive to convergence
+problems than traditional trace plots:
+
+```{r bp-rank}
+mcmc_rank_overlay(draws, pars = c("mu_atg", "sigma_geno_atg"))
+mcmc_rank_hist(draws, pars = c("mu_atg", "sigma_geno_atg"))
+```
+
+### Posterior predictive checks
+
+Comparing the observed data distribution to the posterior predictive
+distribution is a powerful model-checking tool:
+
+```{r bp-ppc}
+# Get fitted values and observed response
+y <- dat$yield
+y_rep <- matrix(fitted(fit), nrow = 1)  # simplified: just posterior mean
+
+# For a proper PPC, you'd generate replicated datasets from the posterior
+# using greta::calculate()
+
+# Density overlay
+bayesplot::ppc_dens_overlay(y, y_rep)
+
+# Use the built-in bayesreml plot method for a quick check
+plot(fit, type = "pp_check")
+```
+
+### Customising bayesplot output
+
+All bayesplot functions return ggplot2 objects, so you can customise them:
+
+```{r bp-custom}
+mcmc_areas(draws,
+           pars = c("tau_envE2", "tau_envE3", "tau_envE4"),
+           prob = 0.95) +
+  labs(
+    title = "Environment Effects (relative to E1)",
+    subtitle = "Posterior distributions with 95% credible intervals",
+    x = "Effect size (yield units)"
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+```
+
+---
+
+## Accessing the evaluation environment
+
+The `$env` component is the R environment in which the generated greta code was
+evaluated. It contains all intermediate objects:
+
+```{r env-access}
+# List all objects in the evaluation environment
+ls(fit$greta$env)
+
+# Access the raw MCMC draws object
+fit$greta$env$atg_draws
+
+# Access the greta model object
+fit$greta$env$atg_model
+
+# Access the design matrix used internally
+# (object names depend on the model)
+```
+
+This is useful for debugging or for accessing objects that bayesreml does not
+explicitly expose.
+
+---
+
+## Working with the generated greta code
+
+The generated code is stored in `fit$extras$code`. You can use it as a starting
+point for custom models:
+
+```{r generated-code}
+# View the generated code
+cat(fit$extras$code)
+
+# Copy, modify, and run manually
+# For example, change a prior or add a parameter
+```
+
+A typical workflow for model customisation:
+
+1. Start with bayesreml to get the basic code structure
+2. Use `return_code = TRUE` to retrieve the code without fitting
+3. Modify the code (change priors, add constraints, etc.)
+4. Run the modified code directly in greta
+
+```{r custom-code}
+# Get the code template
+code <- bayesreml(
+  yield ~ env,
+  random      = ~ geno,
+  data        = dat,
+  return_code = TRUE
+)
+cat(code)
+
+# Now you can copy this code, modify it, and run it directly with greta
+```
+
+---
+
+## Recipes
+
+### Recipe 1: Posterior probability of a hypothesis
+
+Compute the posterior probability that the environment E3 effect exceeds 5
+yield units above the reference (E1):
+
+```{r recipe-hypothesis}
+all_draws <- do.call(rbind, lapply(draws, as.matrix))
+tau_E3 <- all_draws[, "tau_envE3"]
+
+# P(tau_E3 > 5)
+prob <- mean(tau_E3 > 5)
+cat("P(env E3 effect > 5) =", round(prob, 3), "\n")
+```
+
+### Recipe 2: Heritability with credible interval
+
+```{r recipe-h2}
+sigma_g <- all_draws[, "sigma_geno_atg"]
+sigma_e <- all_draws[, "sigma_e_atg"]
+
+h2 <- sigma_g^2 / (sigma_g^2 + sigma_e^2)
+cat("Heritability: mean =", round(mean(h2), 3),
+    ", 95% CrI = [", round(quantile(h2, 0.025), 3), ",",
+    round(quantile(h2, 0.975), 3), "]\n")
+```
+
+### Recipe 3: Posterior predictive intervals for new observations
+
+```{r recipe-pred-interval}
+# Predictive distribution for a new observation in E2
+mu <- all_draws[, "mu_atg"]
+tau_E2 <- all_draws[, "tau_envE2"]
+sigma_e <- all_draws[, "sigma_e_atg"]
+
+# Linear predictor for E2 (fixed effect only, no random genotype effect)
+eta_E2 <- mu + tau_E2
+
+# Posterior predictive: add residual noise
+y_new <- rnorm(length(eta_E2), mean = eta_E2, sd = sigma_e)
+
+cat("Predictive interval for new obs in E2:\n")
+cat("  Mean:", round(mean(y_new), 2), "\n")
+cat("  95% PI: [", round(quantile(y_new, 0.025), 2), ",",
+    round(quantile(y_new, 0.975), 2), "]\n")
+```
+
+### Recipe 4: ROPE (Region of Practical Equivalence)
+
+The ROPE procedure tests whether a parameter is "practically zero" by checking
+what proportion of the posterior falls within a region of practical equivalence:
+
+```{r recipe-rope}
+# Is the E2 effect practically zero?
+# Define ROPE as [-0.5, 0.5] yield units
+rope <- c(-0.5, 0.5)
+tau_E2 <- all_draws[, "tau_envE2"]
+
+in_rope <- mean(tau_E2 > rope[1] & tau_E2 < rope[2])
+cat("Proportion of posterior in ROPE:", round(in_rope, 3), "\n")
+
+if (in_rope > 0.95) {
+  cat("Conclusion: Effect is practically zero\n")
+} else if (in_rope < 0.05) {
+  cat("Conclusion: Effect is practically significant\n")
+} else {
+  cat("Conclusion: Undecided\n")
+}
+```
+
+---
+
+## Performance considerations
+
+### Memory
+
+MCMC draws can be large. For a model with $p$ parameters, $n_s$ samples, and
+$n_c$ chains, the draws matrix has $n_s \times n_c \times p$ elements. For very
+large models:
+
+- Use `thin` (if supported) to reduce autocorrelation and memory
+- Work with `posterior::draws_rvars` for compact representation
+- Subset to parameters of interest before analysis
+
+### Speed
+
+- `greta::extra_samples()` is faster than refitting because it skips warmup
+- `greta::calculate()` is fast for derived quantities because it reuses
+  existing draws
+- bayesplot functions handle large draw sets efficiently
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

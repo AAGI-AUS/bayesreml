@@ -1,0 +1,621 @@
+---
+title: "Tutorial 5: Spatial Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 5: Spatial Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+Field experiments are conducted on heterogeneous soil. Neighbouring
+plots tend to have similar yields due to shared soil, moisture, and
+microclimate conditions. Spatial models account for this correlation,
+improving the precision of treatment comparisons.
+
+This tutorial demonstrates how to:
+
+- Visualise spatial patterns in raw data
+- Fit first-order autoregressive models: AR1(row) and AR1(row):AR1(col)
+- Fit IID spatial random effects as an alternative
+- Interpret autoregressive parameters
+- Compare spatial residuals before and after correction
+- Compute empirical variograms
+- Produce publication-quality field heatmaps
+- Compare adjusted vs unadjusted BLUPs
+
+The dataset is `agridat::gilmour.serpentine`, a wheat trial on a
+10-row by 15-column field with serpentine harvesting pattern.
+
+
+## Mathematical background
+
+### The spatial mixed model
+
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \mathbf{Z}\mathbf{u} + \boldsymbol{\xi} + \boldsymbol{\varepsilon}
+$$
+
+where $\boldsymbol{\xi}$ is the spatially correlated error and
+$\boldsymbol{\varepsilon}$ is the independent (nugget) error.
+
+### AR1 correlation structure
+
+The first-order autoregressive process defines correlation between
+positions $i$ and $j$ as:
+
+$$
+\text{Cor}(\xi_i, \xi_j) = \rho^{|i-j|}
+$$
+
+where $\rho \in (-1, 1)$ is the autocorrelation parameter. Higher
+$|\rho|$ means stronger spatial dependence.
+
+### Separable AR1 x AR1
+
+For a two-dimensional field (rows and columns), the separable model
+uses:
+
+$$
+\mathbf{R} = \sigma_\xi^2 \left(\mathbf{R}_{\text{row}} \otimes \mathbf{R}_{\text{col}}\right)
+$$
+
+where $\mathbf{R}_{\text{row}}$ has elements $\rho_r^{|i-i'|}$ and
+$\mathbf{R}_{\text{col}}$ has elements $\rho_c^{|j-j'|}$. This is the
+standard ASReml spatial model.
+
+### IID spatial random effects
+
+When the AR1 structure is not appropriate (e.g., irregular layouts or
+when row/column indices do not reflect spatial proximity), a simpler
+approach is to include row, column, or row-by-column interaction as
+IID random effects. This absorbs spatial variation without imposing
+a specific correlation structure.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(agridat)
+```
+
+```{r data}
+data(gilmour.serpentine, package = "agridat")
+str(gilmour.serpentine)
+
+serp <- gilmour.serpentine
+serp$row <- factor(serp$row)
+serp$col <- factor(serp$col)
+serp$gen <- factor(serp$gen)
+
+# Numeric coordinates for variograms
+serp$row_num <- as.numeric(serp$row)
+serp$col_num <- as.numeric(serp$col)
+
+cat("Rows:", nlevels(serp$row), "\n")
+cat("Columns:", nlevels(serp$col), "\n")
+cat("Genotypes:", nlevels(serp$gen), "\n")
+cat("Observations:", nrow(serp), "\n")
+```
+
+
+## Exploratory spatial analysis
+
+### Raw data heatmap
+
+```{r raw-heatmap, fig.width=8, fig.height=4}
+ggplot(serp, aes(x = as.numeric(col), y = as.numeric(row),
+                  fill = yield)) +
+  geom_tile(colour = "grey90") +
+  scale_fill_viridis_c(option = "C", name = "Yield") +
+  scale_y_reverse() +
+  labs(
+    x     = "Column",
+    y     = "Row",
+    title = "Raw yield across the field"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title  = element_text(face = "bold", hjust = 0.5),
+    panel.grid  = element_blank()
+  ) +
+  coord_fixed(ratio = 1)
+```
+
+**Interpretation:** Look for gradients (e.g., yield increasing from one
+side to the other) or patches (localised high/low areas). These spatial
+patterns inflate the error variance if ignored, reducing the power to
+detect genotype differences.
+
+
+### Row and column means
+
+```{r row-col-means, fig.width=8, fig.height=4}
+row_means <- serp %>%
+  group_by(row) %>%
+  summarise(mean_yield = mean(yield, na.rm = TRUE), .groups = "drop")
+
+col_means <- serp %>%
+  group_by(col) %>%
+  summarise(mean_yield = mean(yield, na.rm = TRUE), .groups = "drop")
+
+p_row <- ggplot(row_means, aes(x = as.numeric(row), y = mean_yield)) +
+  geom_line(colour = "#0072B2") +
+  geom_point(colour = "#0072B2", size = 2) +
+  labs(x = "Row", y = "Mean yield", title = "Row means") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_col <- ggplot(col_means, aes(x = as.numeric(col), y = mean_yield)) +
+  geom_line(colour = "#D55E00") +
+  geom_point(colour = "#D55E00", size = 2) +
+  labs(x = "Column", y = "Mean yield", title = "Column means") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+library(patchwork)
+p_row + p_col
+```
+
+
+## Baseline model (no spatial correction)
+
+For comparison, first fit a model without spatial effects:
+
+```{r m-base}
+m_base <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen,
+  data      = serp,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_base)
+```
+
+
+## Model 5a: AR1 in rows only
+
+Model spatial correlation along rows (e.g., within the planting
+direction):
+
+$$
+\mathbf{R}_{\text{row}} = \sigma_\xi^2 \begin{pmatrix}
+1 & \rho_r & \rho_r^2 & \cdots \\
+\rho_r & 1 & \rho_r & \cdots \\
+\vdots & & \ddots & \\
+\end{pmatrix}
+$$
+
+In `bayesreml`, the AR1 structure is specified in the residual (rcov)
+formula using `ar1()` syntax:
+
+```{r m5a-fit}
+m_5a <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen,
+  rcov      = ~ ar1(row):id(col),
+  data      = serp,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_5a)
+```
+
+### AR1 parameter interpretation
+
+```{r m5a-ar1-param}
+# Extract the autocorrelation parameter
+all_draws <- do.call(rbind, lapply(m_5a$greta$draws, as.matrix))
+rho_cols <- grep("rho|ar1", colnames(all_draws), value = TRUE)
+
+if (length(rho_cols) > 0) {
+  rho_row <- all_draws[, rho_cols[1]]
+  cat("Row AR1 parameter (rho_row):\n")
+  cat("  Posterior mean:", round(mean(rho_row), 3), "\n")
+  cat("  95% CrI:",
+      round(quantile(rho_row, 0.025), 3), "-",
+      round(quantile(rho_row, 0.975), 3), "\n")
+}
+```
+
+**Interpretation:** A $\rho_r$ close to 1 indicates strong spatial
+correlation along rows. Values above 0.3 generally justify the spatial
+model. If $\rho_r \approx 0$, there is no spatial dependence in the row
+direction, and the model reduces to iid residuals.
+
+
+## Model 5b: AR1(row) x AR1(col) --- separable 2D spatial model
+
+The standard ASReml spatial model uses a separable AR1 x AR1 structure:
+
+```{r m5b-fit}
+m_5b <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen,
+  rcov      = ~ ar1(row):ar1(col),
+  data      = serp,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_5b)
+```
+
+### AR1 parameters for both dimensions
+
+```{r m5b-ar1-params}
+all_draws <- do.call(rbind, lapply(m_5b$greta$draws, as.matrix))
+rho_cols <- grep("rho|ar1", colnames(all_draws), value = TRUE)
+
+for (rc in rho_cols) {
+  vals <- all_draws[, rc]
+  cat(rc, ": mean =", round(mean(vals), 3),
+      ", 95% CrI = [", round(quantile(vals, 0.025), 3), ",",
+      round(quantile(vals, 0.975), 3), "]\n")
+}
+```
+
+**Interpretation:** Typically $\rho_c$ (column autocorrelation) is
+larger than $\rho_r$ (row autocorrelation) because plots within a column
+share more soil characteristics. The product $\rho_r \cdot \rho_c$
+gives the correlation between diagonally adjacent plots.
+
+
+## Model 5c: IID row and column random effects
+
+When AR1 is not appropriate, a simpler approach adds row and column as
+IID random effects to absorb spatial gradients:
+
+```{r m5c-fit}
+m_5c <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen + row + col,
+  data      = serp,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_5c)
+```
+
+**Interpretation:** Adding row and column as IID random effects captures
+broad spatial gradients without assuming a specific correlation decay.
+This is a useful first step before committing to an AR1 model. If the
+row/column variance components are large relative to the residual,
+spatial trends are present and an AR1 model may further improve fit.
+
+
+## Model 5d: AR1(row) with nested block effects
+
+Another approach combines AR1 in one dimension with blocking in the
+other. This is useful when columns form natural blocks (e.g., reps):
+
+```{r m5d-fit}
+m_5d <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ gen + col,
+  rcov      = ~ ar1(row):id(col),
+  data      = serp,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_5d)
+```
+
+**Interpretation:** This model accounts for spatial autocorrelation
+along rows via AR1, while column effects are absorbed by an IID random
+term. This can be effective when the column direction shows discrete
+jumps (e.g., between replicates) rather than smooth autocorrelation.
+
+
+## Model comparison
+
+```{r model-compare}
+anova(m_base, m_5a, m_5b, m_5c, m_5d)
+```
+
+**Interpretation:** The AR1(row):AR1(col) model is the standard choice
+for regular grid layouts (as used by ASReml). IID row/column effects
+offer a simpler alternative when AR1 is not justified. The non-spatial
+baseline should have the worst fit if spatial trends are present.
+
+
+## Spatial residual diagnostics
+
+### Residual heatmaps: before and after spatial correction
+
+```{r residual-heatmaps, fig.width=10, fig.height=4}
+# Residuals from baseline (no spatial)
+serp$resid_base <- residuals(m_base)
+
+# Residuals from AR1xAR1 model
+serp$resid_ar1  <- residuals(m_5b)
+
+p_before <- ggplot(serp, aes(x = as.numeric(col), y = as.numeric(row),
+                              fill = resid_base)) +
+  geom_tile(colour = "grey90") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "Residual") +
+  scale_y_reverse() +
+  labs(x = "Column", y = "Row",
+       title = "Residuals: no spatial model") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5)) +
+  coord_fixed()
+
+p_after <- ggplot(serp, aes(x = as.numeric(col), y = as.numeric(row),
+                             fill = resid_ar1)) +
+  geom_tile(colour = "grey90") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, name = "Residual") +
+  scale_y_reverse() +
+  labs(x = "Column", y = "Row",
+       title = "Residuals: AR1(row) x AR1(col)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5)) +
+  coord_fixed()
+
+p_before + p_after
+```
+
+**Interpretation:** The baseline residual map should show spatial
+patterning (patches of similar colour). After spatial correction, the
+residuals should appear more random, with no obvious patches or
+gradients. If patterns remain, the spatial structure may need refinement
+(e.g., adding row/column effects or using a more flexible model).
+
+
+### Empirical variogram
+
+```{r variogram, fig.width=6, fig.height=5}
+# Compute empirical variogram from baseline residuals
+resid_df <- serp %>%
+  select(row_num, col_num, resid_base) %>%
+  filter(!is.na(resid_base))
+
+# Pairwise distances and squared differences
+n <- nrow(resid_df)
+pairs <- expand.grid(i = 1:n, j = 1:n) %>%
+  filter(i < j)
+
+pairs$dist <- sqrt(
+  (resid_df$row_num[pairs$i] - resid_df$row_num[pairs$j])^2 +
+  (resid_df$col_num[pairs$i] - resid_df$col_num[pairs$j])^2
+)
+
+pairs$semivar <- 0.5 * (resid_df$resid_base[pairs$i] -
+                         resid_df$resid_base[pairs$j])^2
+
+# Bin into distance classes
+pairs$dist_class <- cut(pairs$dist,
+                        breaks = seq(0, max(pairs$dist), length.out = 15))
+
+vario <- pairs %>%
+  group_by(dist_class) %>%
+  summarise(
+    mean_dist = mean(dist),
+    semivariance = mean(semivar),
+    n_pairs = n(),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(dist_class))
+
+ggplot(vario, aes(x = mean_dist, y = semivariance)) +
+  geom_point(aes(size = n_pairs), colour = "#0072B2", alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, colour = "#D55E00",
+              linetype = "dashed") +
+  labs(
+    x     = "Distance (plot units)",
+    y     = "Semivariance",
+    size  = "N pairs",
+    title = "Empirical variogram (baseline residuals)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** An increasing variogram (semivariance increases
+with distance) confirms spatial autocorrelation. The distance at which
+the variogram levels off (the "range") indicates the extent of spatial
+dependence. If the variogram is flat from the origin, there is no
+spatial correlation.
+
+
+## Adjusted vs unadjusted BLUPs
+
+A critical practical question: does the spatial model change genotype
+rankings?
+
+```{r blup-comparison, fig.width=6, fig.height=6}
+# BLUPs from baseline model
+blups_base <- m_base$extras$blups$gen
+
+# BLUPs from AR1xAR1 model
+blups_ar1 <- m_5b$extras$blups$gen
+
+# Match genotype names
+common_gen <- intersect(names(blups_base), names(blups_ar1))
+
+blup_compare <- data.frame(
+  gen        = common_gen,
+  unadjusted = blups_base[common_gen],
+  adjusted   = blups_ar1[common_gen]
+)
+
+# Rank correlation
+rank_cor <- cor(rank(blup_compare$unadjusted),
+                rank(blup_compare$adjusted),
+                method = "spearman")
+
+ggplot(blup_compare, aes(x = unadjusted, y = adjusted)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey60") +
+  geom_point(size = 2, colour = "#009E73", alpha = 0.7) +
+  labs(
+    x     = "BLUP (no spatial model)",
+    y     = "BLUP (AR1 x AR1 spatial model)",
+    title = paste0("BLUPs: spatial vs non-spatial (Spearman r = ",
+                   round(rank_cor, 3), ")")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** If the Spearman rank correlation is high (> 0.95),
+the spatial model does not substantially alter genotype rankings, but
+it still reduces standard errors (narrower CrIs). If rank correlation
+is lower, spatial correction meaningfully changes which genotypes are
+selected --- this justifies the additional model complexity.
+
+
+### Top genotypes comparison
+
+```{r top-genotypes}
+blup_compare <- blup_compare %>%
+  mutate(
+    rank_unadj = rank(-unadjusted),
+    rank_adj   = rank(-adjusted),
+    rank_change = rank_unadj - rank_adj
+  ) %>%
+  arrange(rank_adj)
+
+cat("Top 10 genotypes (spatially adjusted):\n")
+print(head(blup_compare, 10))
+
+cat("\nLargest rank changes:\n")
+print(blup_compare %>% arrange(desc(abs(rank_change))) %>% head(5))
+```
+
+
+## Field map of adjusted BLUPs
+
+```{r field-map, fig.width=8, fig.height=4}
+# Map BLUPs back to field positions
+serp$blup_adj <- blups_ar1[as.character(serp$gen)]
+
+ggplot(serp, aes(x = as.numeric(col), y = as.numeric(row),
+                  fill = blup_adj)) +
+  geom_tile(colour = "grey90") +
+  scale_fill_gradient2(low = "#D55E00", mid = "white", high = "#009E73",
+                       midpoint = 0, name = "BLUP") +
+  scale_y_reverse() +
+  labs(
+    x     = "Column",
+    y     = "Row",
+    title = "Field map: spatially adjusted genotype BLUPs"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ) +
+  coord_fixed()
+```
+
+
+## Diagnostic plots
+
+```{r diagnostics}
+# MCMC convergence
+plot(m_5b, type = "diagnostics")
+
+# Residual diagnostics
+plot(m_5b, type = "residuals")
+
+# Variance components
+plot(m_5b, type = "variance")
+
+# Posterior predictive check
+plot(m_5b, type = "pp_check")
+```
+
+
+## Generated code inspection
+
+```{r code-inspect}
+# View the greta code generated for the AR1xAR1 model
+cat(m_5b$extras$code)
+```
+
+
+## Tips for spatial models
+
+1. **Regular vs irregular grids:** AR1 x AR1 is designed for regular
+   rectangular grids where row and column indices are meaningful.
+   For irregular layouts, use IID row/column random effects to absorb
+   spatial variation without imposing a specific correlation structure.
+
+2. **Serpentine harvesting:** The `gilmour.serpentine` dataset has a
+   serpentine harvesting pattern. The AR1(col) parameter may capture
+   harvester effects in addition to soil trends. Consider including
+   explicit serpentine covariates if this is a concern.
+
+3. **Row and column effects:** Before jumping to AR1, try adding row
+   and column as fixed or random effects. Sometimes simple row/column
+   adjustment is sufficient:
+   ```r
+   m_rowcol <- bayesreml(
+     fixed  = yield ~ 1,
+     random = ~ gen + row + col,
+     data   = serp
+   )
+   ```
+
+4. **Nugget effect:** The AR1 x AR1 model separates the variance into
+   spatially correlated ($\sigma_\xi^2$) and independent
+   ($\sigma_e^2$, the nugget) components. The ratio
+   $\sigma_e^2 / (\sigma_\xi^2 + \sigma_e^2)$ indicates the proportion
+   of non-spatial residual variation.
+
+5. **Convergence:** Spatial autocorrelation parameters can be difficult
+   to estimate. If convergence is poor (Rhat > 1.05), try:
+   - Increasing `warmup` (e.g., 1000 or 2000)
+   - Using a more informative `prior_vc_sd` (e.g., 0.5)
+   - Simplifying to AR1 in one dimension only
+
+6. **Anisotropy:** The separable AR1 x AR1 model naturally accommodates
+   anisotropy (different correlation strengths in row vs column
+   directions) through separate $\rho_r$ and $\rho_c$ parameters.
+
+7. **Large fields:** For large fields (> 1000 plots), the dense
+   correlation matrix can be computationally expensive. Consider
+   sparse approximations or running on a GPU via
+   `greta::install_greta_deps(type = "gpu")`.
+
+
+## Summary
+
+| Model    | Spatial structure                | Formula                             | Parameters |
+|----------|----------------------------------|-------------------------------------|-----------|
+| Baseline | None (iid)                       | `rcov = ~ units`                    | 1         |
+| `m_5a`   | AR1 (rows only)                  | `rcov = ~ ar1(row):id(col)`        | 2         |
+| `m_5b`   | AR1 x AR1 (2D)                   | `rcov = ~ ar1(row):ar1(col)`       | 3         |
+| `m_5c`   | IID row + column random effects  | `random = ~ gen + row + col`        | 3         |
+| `m_5d`   | AR1(row) + IID column random     | `rcov = ~ ar1(row):id(col)` + col   | 3         |
+
+The AR1(row):AR1(col) model is the workhorse of spatial analysis in
+plant breeding trials, directly equivalent to the standard ASReml
+spatial model. The Bayesian implementation in `bayesreml` provides
+full posterior distributions for all parameters including the
+autocorrelation parameters, enabling proper uncertainty propagation
+to genotype BLUPs and selection decisions.

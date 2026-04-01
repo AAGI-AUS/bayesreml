@@ -1,0 +1,9 @@
+/doc/
+/Meta/
+*.Rcheck/
+..Rcheck/
+*.tar.gz
+Rplots.pdf
+.Rhistory
+.RData
+.Rproj.user

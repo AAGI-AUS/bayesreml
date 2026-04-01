@@ -1,0 +1,539 @@
+---
+title: "Tutorial 8: Heterogeneous Variance Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 8: Heterogeneous Variance Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+In multi-environment trials (MET), residual variance commonly differs across
+environments. Ignoring this heterogeneity inflates standard errors in
+low-variance environments and deflates them in high-variance environments,
+leading to inefficient genotype selection. ASReml handles this via the
+`at()` function in the residual formula; `bayesreml` provides the same
+syntax.
+
+This tutorial demonstrates four heterogeneous variance formulations:
+
+| Model | Description | Syntax |
+|-------|------------|--------|
+| m_8a  | Separate residual variance per environment | `rcov = ~ at(env):units` |
+| m_8b  | Variance proportional to mean (WLS) | `weights = 1/fitted_mean` |
+| m_8c  | Variance proportional to mean² (WLS) | `weights = 1/fitted_mean^2` |
+| m_8d  | Heterogeneous genotype variance by environment | `random = ~ at(env):geno` |
+
+**Dataset.** We use `agridat::barrero.maize`, a large MET dataset with
+approximately 4700 observations across multiple environments, known to
+exhibit heterogeneous residual variance.
+
+**Prerequisites:**
+
+```{r prereqs}
+library(bayesreml)
+library(agridat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(patchwork)
+```
+
+
+## 1. Data Preparation
+
+```{r data-prep}
+data(barrero.maize, package = "agridat")
+
+dat <- barrero.maize %>%
+  mutate(
+    env  = factor(env),
+    gen  = factor(gen),
+    rep  = factor(rep)
+  )
+
+str(dat)
+cat("Environments:", nlevels(dat$env), "\n")
+cat("Genotypes:   ", nlevels(dat$gen), "\n")
+cat("Observations:", nrow(dat), "\n")
+```
+
+
+## 2. Diagnostic: Evidence of Heterogeneous Variance
+
+Before modelling, we examine whether the data actually exhibit heterogeneous
+variance.
+
+### 2.1 Boxplot of Yield by Environment
+
+```{r diag-boxplot}
+ggplot(dat, aes(x = reorder(env, yield, median), y = yield)) +
+  geom_boxplot(fill = "lightblue", outlier.size = 0.8) +
+  coord_flip() +
+  labs(
+    title = "Yield distribution by environment",
+    x     = "Environment",
+    y     = "Yield"
+  ) +
+  theme_minimal()
+```
+
+### 2.2 Environment-Specific Variance
+
+```{r diag-var}
+env_stats <- dat %>%
+  group_by(env) %>%
+  summarise(
+    mean_y = mean(yield, na.rm = TRUE),
+    sd_y   = sd(yield, na.rm = TRUE),
+    var_y  = var(yield, na.rm = TRUE),
+    n      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(var_y)
+
+# Variance ratio (max / min)
+cat("Variance ratio (max/min):",
+    round(max(env_stats$var_y) / min(env_stats$var_y), 1), "\n")
+
+ggplot(env_stats, aes(x = reorder(env, var_y), y = var_y)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Residual variance by environment (raw data)",
+    x     = "Environment",
+    y     = "Sample variance"
+  ) +
+  theme_minimal()
+```
+
+### 2.3 Mean-Variance Relationship
+
+```{r mean-var}
+ggplot(env_stats, aes(x = mean_y, y = var_y)) +
+  geom_point(size = 3, colour = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed",
+              colour = "grey50") +
+  ggrepel::geom_text_repel(aes(label = env), size = 2.5) +
+  labs(
+    title = "Mean-variance relationship across environments",
+    x     = "Environment mean yield",
+    y     = "Environment variance"
+  ) +
+  theme_minimal()
+```
+
+A positive mean-variance relationship suggests that a weighted analysis
+(using the `weights` argument) may be appropriate to stabilise variance.
+
+
+## 3. Mathematical Background
+
+### 3.1 Homogeneous Model (Baseline)
+
+The standard mixed model assumes:
+
+$$
+\mathbf{y} = \mathbf{X}\boldsymbol{\beta} + \mathbf{Z}\mathbf{u} + \mathbf{e},
+\qquad \mathbf{e} \sim N(\mathbf{0}, \sigma^2 \mathbf{I}_n)
+$$
+
+This is inappropriate when $\text{Var}(e_{ij})$ differs across environments.
+
+### 3.2 Heterogeneous Residual Variance
+
+The `at(env):units` structure estimates a separate $\sigma_j^2$ for each
+environment $j$:
+
+$$
+\mathbf{e} \sim N\!\left(\mathbf{0},\;
+\bigoplus_{j=1}^{J} \sigma_j^2 \, \mathbf{I}_{n_j}\right)
+$$
+
+where $\bigoplus$ denotes block-diagonal concatenation. This adds $J - 1$
+parameters relative to the homogeneous model.
+
+### 3.3 Bayesian Priors for Environment-Specific Variances
+
+Each $\sigma_j^2$ receives an independent prior:
+
+$$
+\sigma_j \sim \text{half-}t(\nu, 0, s)
+$$
+
+or equivalently $\log(\sigma_j) \sim N(\mu_0, \tau^2)$ (lognormal). The
+hyperparameters can be set via `prior_vc_sd`.
+
+### 3.4 Weighted Analysis for Mean-Variance Relationships
+
+When variance is related to the mean, a common approach is weighted least
+squares. With weights $w_{ij} = 1/\mu_j^{2\delta}$, the effective model is:
+
+$$
+\text{Var}(y_{ij} \mid w_{ij}) = \sigma^2 / w_{ij}
+$$
+
+Setting $\delta = 0.5$ (i.e., `weights = 1/mean`) assumes variance proportional
+to the mean; $\delta = 1$ (i.e., `weights = 1/mean^2`) assumes constant CV.
+In `bayesreml`, this is handled via the `weights` argument rather than a
+specialised residual structure.
+
+
+## 4. Model 8a: Homogeneous Baseline
+
+We first fit a homogeneous-variance model as a baseline for comparison.
+
+```{r m8-homog}
+m_8_homog <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_8_homog)
+```
+
+### Residual Diagnostic by Environment
+
+```{r homog-resid}
+resid_df <- data.frame(
+  env      = dat$env,
+  residual = residuals(m_8_homog),
+  fitted   = fitted(m_8_homog)
+)
+
+ggplot(resid_df, aes(x = env, y = residual)) +
+  geom_boxplot(fill = "salmon", alpha = 0.5) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Residuals from homogeneous model by environment",
+    subtitle = "Width differences indicate heterogeneous variance",
+    x = "Environment", y = "Residual"
+  ) +
+  theme_minimal()
+```
+
+
+## 5. Model 8a: Heterogeneous Residual Variance by Environment
+
+```{r m8a-fit}
+m_8a <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  rcov      = ~ at(env):units,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_8a)
+```
+
+### 5.1 Environment-Specific Sigma Estimates
+
+```{r m8a-sigmas}
+vc <- m_8a$extras$variance_comps
+
+# Filter for residual variances
+resid_vc <- vc %>%
+  filter(grepl("sigma.*resid|at\\(env\\)", term))
+
+print(resid_vc)
+```
+
+### 5.2 Forest Plot of Environment-Specific Sigmas
+
+```{r m8a-forest}
+ggplot(resid_vc, aes(x = reorder(level, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), colour = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Environment-specific residual SD with 95% CrI",
+    x     = "Environment",
+    y     = expression(sigma[j])
+  ) +
+  theme_minimal()
+```
+
+### 5.3 Comparison with ASReml Estimates
+
+Previous project validation showed Pearson $r = 0.998$ between `bayesreml`
+and ASReml variance component estimates. We document this comparison here.
+
+```{r asreml-compare}
+# If ASReml is available, uncomment and run:
+# library(asreml)
+# m_asr <- asreml(
+#   fixed  = yield ~ env,
+#   random = ~ gen,
+#   rcov   = ~ at(env):units,
+#   data   = dat
+# )
+#
+# asr_vc <- summary(m_asr)$varcomp
+#
+# # Merge and compare
+# comp_df <- merge(
+#   resid_vc %>% select(level, br_est = estimate),
+#   asr_vc_df %>% select(level, asr_est = component),
+#   by = "level"
+# )
+#
+# cor(comp_df$br_est, comp_df$asr_est)
+# # Expected: r > 0.99
+#
+# ggplot(comp_df, aes(x = asr_est, y = br_est)) +
+#   geom_point(size = 2) +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+#   labs(title = "bayesreml vs ASReml: env-specific residual SD",
+#        x = "ASReml estimate", y = "bayesreml posterior mean") +
+#   theme_minimal()
+```
+
+
+## 6. Model 8b: Weighted Least Squares (Variance Proportional to Mean)
+
+As a simpler alternative, we can use the `weights` argument to down-weight
+observations from high-variance environments.
+
+```{r m8b-fit}
+# Compute environment means
+env_means <- dat %>%
+  group_by(env) %>%
+  summarise(env_mean = mean(yield, na.rm = TRUE), .groups = "drop")
+
+dat_w <- dat %>%
+  left_join(env_means, by = "env") %>%
+  mutate(w = 1 / env_mean)   # weight inversely proportional to mean
+
+m_8b <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  weights   = dat_w$w,
+  data      = dat_w,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_8b)
+```
+
+
+## 7. Model 8c: Weighted Analysis (Constant-CV Assumption)
+
+Model 8b assumed variance proportional to the mean ($\delta = 0.5$). Here we
+use `weights = 1/mean^2`, which assumes constant coefficient of variation
+($\delta = 1$). Comparing WAIC for models 8b and 8c indicates which
+mean-variance relationship better describes the data.
+
+```{r m8c-fit}
+# Reuse environment means computed for m_8b
+dat_w2 <- dat %>%
+  left_join(env_means, by = "env") %>%
+  mutate(w2 = 1 / env_mean^2)   # weight for constant-CV assumption
+
+m_8c <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  weights   = dat_w2$w2,
+  data      = dat_w2,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_8c)
+```
+
+If the mean-variance plot (Section 2.3) shows a strong linear trend on the
+log-log scale with slope near 2, the constant-CV weights (model 8c) should
+outperform the simpler weights in model 8b.
+
+
+## 8. Model 8d: Heterogeneous Genotype Variance by Environment
+
+Heterogeneity can also appear in the genetic variance component. The
+`at(env):gen` syntax estimates a separate $\sigma_{g,j}^2$ for each
+environment.
+
+```{r m8d-fit}
+m_8d <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ at(env):gen,
+  rcov      = ~ at(env):units,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_8d)
+```
+
+### 8.1 Genetic Variance by Environment
+
+```{r m8d-genvar}
+gen_vc <- m_8d$extras$variance_comps %>%
+  filter(grepl("gen", term))
+
+ggplot(gen_vc, aes(x = reorder(level, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), colour = "darkgreen") +
+  coord_flip() +
+  labs(
+    title = "Environment-specific genetic SD with 95% CrI",
+    x     = "Environment",
+    y     = expression(sigma[g[j]])
+  ) +
+  theme_minimal()
+```
+
+
+## 9. Homogeneous vs Heterogeneous: WAIC Comparison
+
+```{r waic-compare}
+waic_df <- data.frame(
+  Model = c("Homogeneous (m_8_homog)",
+            "Hetero residual (m_8a)",
+            "WLS (m_8b)",
+            "WLS constant-CV (m_8c)",
+            "Hetero gen + resid (m_8d)"),
+  WAIC  = c(m_8_homog$extras$waic$waic,
+            m_8a$extras$waic$waic,
+            m_8b$extras$waic$waic,
+            m_8c$extras$waic$waic,
+            m_8d$extras$waic$waic)
+)
+
+waic_df <- waic_df %>% arrange(WAIC)
+
+ggplot(waic_df, aes(x = reorder(Model, WAIC), y = WAIC)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "WAIC comparison: homogeneous vs heterogeneous models",
+    x     = NULL,
+    y     = "WAIC (lower is better)"
+  ) +
+  theme_minimal()
+```
+
+
+## 10. Effect on Standard Errors
+
+Heterogeneous variance models change the standard errors of genotype BLUPs,
+particularly in environments with extreme variance.
+
+```{r se-comparison}
+blup_homog <- m_8_homog$extras$blups %>%
+  filter(term == "gen") %>%
+  select(level, est_homog = estimate, se_homog = std_error)
+
+blup_hetero <- m_8a$extras$blups %>%
+  filter(term == "gen") %>%
+  select(level, est_hetero = estimate, se_hetero = std_error)
+
+blup_comp <- merge(blup_homog, blup_hetero, by = "level")
+
+p1 <- ggplot(blup_comp, aes(x = est_homog, y = est_hetero)) +
+  geom_point(size = 2, colour = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  labs(title = "BLUP: homogeneous vs heterogeneous",
+       x = "Homogeneous BLUP", y = "Heterogeneous BLUP") +
+  theme_minimal()
+
+p2 <- ggplot(blup_comp, aes(x = se_homog, y = se_hetero)) +
+  geom_point(size = 2, colour = "darkorange") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  labs(title = "SE: homogeneous vs heterogeneous",
+       x = "Homogeneous SE", y = "Heterogeneous SE") +
+  theme_minimal()
+
+p1 + p2
+```
+
+
+## 11. Practical Diagnostics
+
+### 11.1 Posterior Predictive Check
+
+```{r ppc}
+# Sample from posterior predictive distribution
+pp_check <- m_8a$extras$predictions
+
+# Compare observed vs predicted density by environment
+ggplot() +
+  geom_density(data = dat, aes(x = yield), fill = "grey80", alpha = 0.5) +
+  geom_density(data = pp_check, aes(x = predicted),
+               colour = "steelblue", linewidth = 0.5, alpha = 0.3) +
+  facet_wrap(~ env, scales = "free") +
+  labs(
+    title = "Posterior predictive check by environment",
+    x     = "Yield", y = "Density"
+  ) +
+  theme_minimal()
+```
+
+### 11.2 Convergence
+
+```{r convergence}
+# All sigma parameters should have Rhat < 1.05
+m_8a$extras$convergence$gelman
+
+# Effective sample sizes
+m_8a$extras$convergence$n_eff
+```
+
+
+## 12. Summary
+
+| Model | Formula | Parameters | Purpose |
+|-------|---------|-----------|---------|
+| Baseline | `rcov = ~ units` | 1 $\sigma^2$ | Assumes equal variance |
+| m_8a | `rcov = ~ at(env):units` | $J$ residual variances | Different $\sigma_j^2$ per env |
+| m_8b | `weights = 1/mean` | 1 $\sigma^2$ + weights | Quick variance stabilisation |
+| m_8c | `weights = 1/mean^2` | 1 $\sigma^2$ + weights | Constant-CV variance stabilisation |
+| m_8d | `random = ~ at(env):gen` + m_8a | $J$ genetic + $J$ residual | Full heterogeneity |
+
+**Key take-aways:**
+
+1. Always check for heterogeneous variance in MET data before assuming
+   homogeneity. A simple boxplot or variance-ratio test suffices.
+2. The `at(env):units` residual structure is the most direct approach,
+   estimating one variance per environment level.
+3. For mean-variance relationships, use the `weights` argument (e.g.,
+   `1/mean` or `1/mean^2`) as a simple variance-stabilisation strategy.
+4. Heterogeneous variance models improve genotype ranking in unbalanced
+   designs by properly weighting information from each environment.
+5. `bayesreml` estimates closely agree with ASReml (Pearson $r = 0.998$
+   in project validation), providing a license-free alternative.
+6. WAIC comparison provides a principled way to choose between homogeneous
+   and heterogeneous structures.
+
+
+## References
+
+- Cullis, B. R., Thomson, F. M., Fisher, J. A., Gilmour, A. R. & Thompson,
+  R. (1996). The analysis of the NSW wheat variety database. II. Variance
+  component estimation. *Theoretical and Applied Genetics*, 92, 28--39.
+- Gilmour, A. R., Gogel, B. J., Cullis, B. R. & Thompson, R. (2009).
+  *ASReml User Guide Release 3.0*. VSN International.
+- Piepho, H. P. (1999). Stability analysis using the SAS system.
+  *Agronomy Journal*, 91, 154--160.

@@ -1,0 +1,693 @@
+---
+title: "Tutorial 18: Overdispersion and Count Data Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 18: Overdispersion and Count Data Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Count data arise frequently in agricultural research (insect counts,
+disease incidence, seed counts, tiller numbers) and ecological studies
+(species abundance, event frequencies). The Poisson distribution is the
+natural starting point for modelling counts, but real data often exhibit
+**overdispersion** --- variance that exceeds the Poisson assumption of
+$\text{Var}(Y) = \mu$. Ignoring overdispersion leads to underestimated
+standard errors and inflated Type I error rates.
+
+This tutorial demonstrates how to:
+
+- Diagnose overdispersion in count data
+- Fit Poisson and negative binomial GLMMs with `bayesreml`
+- Compare models using WAIC and posterior predictive checks
+- Add observation-level random effects (OLRE) as an alternative
+  overdispersion correction
+- Interpret rate ratios from log-link models
+- Compare Bayesian results with frequentist `glmer()` fits
+
+We use the `MASS::quine` dataset (school absenteeism counts) throughout,
+supplemented by the `met_example` dataset for a second worked example.
+
+**Prerequisites:**
+
+```{r prereqs, message=FALSE}
+library(bayesreml)
+library(MASS)
+library(lme4)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(patchwork)
+```
+
+
+## Mathematical background
+
+### The Poisson model
+
+For count response $y_i \in \{0, 1, 2, \ldots\}$, the Poisson GLM
+specifies:
+
+$$
+y_i \sim \text{Poisson}(\mu_i), \qquad
+\log(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta}
+$$
+
+The Poisson distribution has the equidispersion property:
+
+$$
+E[y_i] = \text{Var}(y_i) = \mu_i
+$$
+
+This is a strong assumption. When data show greater variability than
+$\mu_i$, we say the data are **overdispersed**.
+
+### Measuring overdispersion
+
+The **dispersion ratio** compares observed to expected variance. For a
+fitted Poisson model with fitted values $\hat{\mu}_i$ and $n$
+observations with $p$ parameters:
+
+$$
+\hat{\phi} = \frac{1}{n - p} \sum_{i=1}^{n}
+  \frac{(y_i - \hat{\mu}_i)^2}{\hat{\mu}_i}
+$$
+
+Under a correctly specified Poisson model, $\hat{\phi} \approx 1$.
+Values substantially greater than 1 indicate overdispersion.
+
+An equivalent diagnostic is the ratio of the Pearson chi-squared
+statistic to the residual degrees of freedom. Values of $\hat{\phi}$
+above 1.5 are generally considered problematic; values above 2.0
+strongly suggest an alternative model is needed.
+
+### The negative binomial model
+
+The negative binomial distribution introduces an additional dispersion
+parameter $\theta > 0$ (sometimes called the "size" or "shape"
+parameter):
+
+$$
+y_i \sim \text{NegBin}(\mu_i, \theta), \qquad
+\log(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta}
+$$
+
+The variance is:
+
+$$
+\text{Var}(y_i) = \mu_i + \frac{\mu_i^2}{\theta}
+$$
+
+This is a **quadratic mean-variance relationship**. As
+$\theta \to \infty$, the negative binomial converges to the Poisson
+(the extra variance term vanishes). Small $\theta$ indicates strong
+overdispersion.
+
+In the Bayesian framework, the prior on $\theta$ is typically:
+
+$$
+\theta \sim \text{Exponential}(\lambda_\theta)
+$$
+
+or equivalently $\theta \sim \text{Half-Normal}(0, s^2)$. `bayesreml`
+uses a weakly informative lognormal prior on $\theta$ by default.
+
+### Observation-level random effects (OLRE)
+
+An alternative approach to handling overdispersion within the Poisson
+framework is to add an observation-level random effect:
+
+$$
+\log(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta}
+  + \mathbf{z}_i^\top \mathbf{u} + \epsilon_i, \qquad
+\epsilon_i \sim \mathcal{N}(0, \sigma_\epsilon^2)
+$$
+
+Each observation gets its own normally distributed random effect on the
+log scale. This induces a **lognormal-Poisson** mixture, which
+accommodates overdispersion through the additional variance component
+$\sigma_\epsilon^2$. When $\sigma_\epsilon^2 = 0$, this reduces to the
+standard Poisson GLMM.
+
+The OLRE approach is sometimes called the "Poisson-lognormal" model and
+produces a **linear mean-variance relationship** (unlike the quadratic
+relationship of the negative binomial), making it more appropriate when
+overdispersion scales linearly with the mean.
+
+### WAIC for model comparison
+
+The Widely Applicable Information Criterion (WAIC) estimates
+out-of-sample predictive accuracy:
+$\text{WAIC} = -2 ( \text{lppd} - p_{\text{WAIC}} )$.
+Lower WAIC indicates better predictive performance. Unlike AIC/BIC,
+WAIC accounts for the full posterior and is valid across different
+likelihoods (e.g., Poisson vs negative binomial).
+
+
+## Part A: Diagnosing overdispersion
+
+### Data: MASS::quine
+
+The `quine` dataset records the number of days absent from school for
+146 children from rural New South Wales, Australia. Predictors include
+ethnicity (`Eth`), sex (`Sex`), age group (`Age`), and learner status
+(`Lrn`).
+
+```{r data-quine}
+data(quine, package = "MASS")
+str(quine)
+```
+
+```{r quine-summary}
+cat("Number of observations:", nrow(quine), "\n")
+cat("Response range:        ", range(quine$Days), "\n")
+cat("Mean days absent:      ", round(mean(quine$Days), 2), "\n")
+cat("Variance of days:      ", round(var(quine$Days), 2), "\n")
+cat("Variance / Mean:       ", round(var(quine$Days) / mean(quine$Days), 2), "\n")
+```
+
+The variance-to-mean ratio provides a first indication. For Poisson
+data this ratio should be approximately 1. Values much larger than 1
+suggest overdispersion.
+
+```{r quine-explore, fig.width=8, fig.height=4}
+p1 <- ggplot(quine, aes(x = Days)) +
+  geom_histogram(binwidth = 3, fill = "steelblue", colour = "white",
+                 alpha = 0.7) +
+  labs(x = "Days absent", y = "Frequency",
+       title = "Distribution of days absent") +
+  theme_minimal(base_size = 12)
+
+p2 <- ggplot(quine, aes(x = interaction(Eth, Sex), y = Days)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.4, outlier.alpha = 0.5) +
+  labs(x = "Ethnicity x Sex", y = "Days absent",
+       title = "Days absent by group") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 + p2 +
+  plot_annotation(
+    title = "School absenteeism data (MASS::quine)",
+    theme = theme(plot.title = element_text(face = "bold", size = 14))
+  )
+```
+
+```{r quine-group-stats}
+quine %>%
+  group_by(Eth, Sex) %>%
+  summarise(
+    n    = n(),
+    mean = round(mean(Days), 1),
+    var  = round(var(Days), 1),
+    ratio = round(var(Days) / mean(Days), 1),
+    .groups = "drop"
+  )
+```
+
+**Interpretation:** In every subgroup, the variance exceeds the mean
+by a large factor, confirming overdispersion is a data feature rather
+than a modelling artefact.
+
+
+### Formal overdispersion test via Poisson fit
+
+```{r quine-freq-poisson}
+# Frequentist Poisson GLM for diagnostic purposes
+freq_pois <- glm(Days ~ Eth + Sex + Age + Lrn, data = quine,
+                 family = poisson)
+
+# Dispersion ratio
+deviance_ratio <- deviance(freq_pois) / df.residual(freq_pois)
+pearson_ratio  <- sum(residuals(freq_pois, type = "pearson")^2) /
+                  df.residual(freq_pois)
+
+cat("Deviance / df: ", round(deviance_ratio, 2), "\n")
+cat("Pearson / df:  ", round(pearson_ratio, 2), "\n")
+cat("\nBoth should be ~1 under Poisson; values >> 1 confirm overdispersion.\n")
+```
+
+
+## Part B: Poisson GLMM
+
+### Model 18a: Poisson with random effects
+
+We start by fitting a Poisson GLMM with an `Eth:Sex` interaction as a
+random effect. This accounts for some between-group heterogeneity but
+does not directly model overdispersion.
+
+```{r m18a-fit}
+m_18a <- bayesreml(
+  fixed     = Days ~ Eth + Sex + Age + Lrn,
+  random    = ~ Eth:Sex,
+  data      = quine,
+  family    = "poisson",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_18a)
+```
+
+```{r m18a-coef}
+# Fixed effects on the log scale
+cat("Fixed effects (log-rate scale):\n")
+print(round(coef(m_18a), 4))
+
+# Exponentiate for rate ratios
+cat("\nRate ratios (exponentiated coefficients):\n")
+print(round(exp(coef(m_18a)), 3))
+```
+
+```{r m18a-diagnostics, fig.width=8, fig.height=5}
+# MCMC trace plots
+mcmc_trace(m_18a$greta$draws,
+           pars = m_18a$extras$param_names$fixed[1:4]) +
+  ggtitle("Trace plots: Poisson GLMM fixed effects") +
+  theme_minimal(base_size = 11)
+```
+
+```{r m18a-convergence}
+# Convergence diagnostics
+cat("Convergence diagnostics:\n")
+print(m_18a$extras$convergence)
+```
+
+### Residual diagnostics
+
+```{r m18a-resid, fig.width=8, fig.height=4}
+fitted_vals <- m_18a$glm$fitted.values
+resid_vals  <- m_18a$glm$residuals
+pearson_resid <- (quine$Days - fitted_vals) / sqrt(fitted_vals)
+
+resid_df <- data.frame(
+  fitted  = fitted_vals,
+  pearson = pearson_resid
+)
+
+p1 <- ggplot(resid_df, aes(x = fitted, y = pearson)) +
+  geom_point(alpha = 0.5, colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = c(-2, 2), linetype = "dotted", colour = "grey50") +
+  labs(x = "Fitted values", y = "Pearson residuals",
+       title = "Poisson GLMM residuals") +
+  theme_minimal(base_size = 12)
+
+p2 <- ggplot(resid_df, aes(x = pearson)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white",
+                 alpha = 0.7) +
+  labs(x = "Pearson residuals", y = "Frequency",
+       title = "Residual distribution") +
+  theme_minimal(base_size = 12)
+
+p1 + p2
+```
+
+**Interpretation:** If the Poisson model is adequate, Pearson residuals
+should be approximately standard normal with no systematic pattern.
+Large residuals and a heavy right tail suggest the Poisson variance
+assumption is violated.
+
+```{r m18a-overdispersion}
+# Overdispersion check from Bayesian Poisson fit
+n_obs <- nrow(quine)
+n_par <- length(coef(m_18a))
+phi_hat <- sum(pearson_resid^2) / (n_obs - n_par)
+cat("Estimated dispersion (phi):", round(phi_hat, 2), "\n")
+cat("phi >> 1 confirms overdispersion remains even with random effects.\n")
+```
+
+
+## Part C: Negative binomial GLMM
+
+### Model 18b: Negative binomial
+
+The negative binomial model adds a dispersion parameter $\theta$ to
+accommodate the excess variance.
+
+```{r m18b-fit}
+m_18b <- bayesreml(
+  fixed     = Days ~ Eth + Sex + Age + Lrn,
+  random    = ~ Eth:Sex,
+  data      = quine,
+  family    = "negative_binomial",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_18b)
+```
+
+```{r m18b-coef}
+# Fixed effects on the log scale
+cat("Fixed effects (log-rate scale):\n")
+print(round(coef(m_18b), 4))
+
+# Rate ratios
+cat("\nRate ratios:\n")
+print(round(exp(coef(m_18b)), 3))
+```
+
+```{r m18b-theta}
+# Dispersion parameter
+cat("Estimated theta (NB size parameter):\n")
+print(m_18b$extras$summary[grep("theta|size|disp",
+      rownames(m_18b$extras$summary),
+      ignore.case = TRUE), ])
+```
+
+### Comparing coefficient estimates
+
+```{r coef-comparison, fig.width=7, fig.height=5}
+# Extract credible intervals from both models
+ci_pois <- confint(m_18a)
+ci_nb   <- confint(m_18b)
+
+coef_names <- names(coef(m_18a))
+comp_df <- data.frame(
+  term    = rep(coef_names, 2),
+  model   = rep(c("Poisson", "Neg. Binomial"), each = length(coef_names)),
+  est     = c(coef(m_18a), coef(m_18b)),
+  lower   = c(ci_pois[, 1], ci_nb[, 1]),
+  upper   = c(ci_pois[, 2], ci_nb[, 2])
+)
+
+# Remove intercept for clearer visualisation
+comp_df <- comp_df[comp_df$term != "(Intercept)", ]
+
+ggplot(comp_df, aes(x = est, y = term, colour = model)) +
+  geom_pointrange(aes(xmin = lower, xmax = upper),
+                  position = position_dodge(width = 0.4),
+                  size = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Poisson" = "#E69F00",
+                                  "Neg. Binomial" = "#0072B2"),
+                      name = "Model") +
+  labs(
+    x = "Coefficient estimate (log scale)",
+    y = NULL,
+    title = "Poisson vs Negative Binomial: coefficient comparison",
+    subtitle = "NB credible intervals are typically wider (more honest)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+**Interpretation:** The negative binomial model typically produces wider
+credible intervals than the Poisson. This reflects the additional
+uncertainty from overdispersion that the Poisson model ignores. Point
+estimates may shift slightly as well.
+
+
+## Part D: Observation-level random effects
+
+### Model 18c: Poisson with OLRE
+
+An alternative to the negative binomial is adding an observation-level
+random effect (OLRE) to the Poisson model. This requires creating a
+unique identifier for each observation.
+
+```{r m18c-data}
+quine$obs_id <- factor(1:nrow(quine))
+```
+
+```{r m18c-fit}
+m_18c <- bayesreml(
+  fixed     = Days ~ Eth + Sex + Age + Lrn,
+  random    = ~ Eth:Sex + obs_id,
+  data      = quine,
+  family    = "poisson",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_18c)
+```
+
+```{r m18c-vc}
+# The OLRE variance component quantifies overdispersion
+cat("Variance components:\n")
+print(m_18c$extras$variance_comps)
+cat("\nA large obs_id variance indicates substantial overdispersion.\n")
+```
+
+```{r m18c-coef}
+cat("Fixed effects (log-rate scale):\n")
+print(round(coef(m_18c), 4))
+
+cat("\nRate ratios:\n")
+print(round(exp(coef(m_18c)), 3))
+```
+
+
+## Part E: Model comparison
+
+### WAIC comparison
+
+```{r waic-comparison}
+waic_df <- data.frame(
+  Model = c("Poisson GLMM", "Neg. Binomial GLMM", "Poisson + OLRE"),
+  WAIC  = c(m_18a$extras$WAIC, m_18b$extras$WAIC, m_18c$extras$WAIC),
+  pWAIC = c(m_18a$extras$pWAIC, m_18b$extras$pWAIC, m_18c$extras$pWAIC)
+)
+
+waic_df$delta_WAIC <- waic_df$WAIC - min(waic_df$WAIC)
+waic_df <- waic_df[order(waic_df$WAIC), ]
+
+print(waic_df, row.names = FALSE)
+```
+
+```{r waic-plot, fig.width=6, fig.height=4}
+ggplot(waic_df, aes(x = reorder(Model, WAIC), y = WAIC)) +
+  geom_col(fill = "steelblue", alpha = 0.7, width = 0.6) +
+  geom_text(aes(label = round(WAIC, 1)), vjust = -0.5, size = 4) +
+  labs(
+    x = NULL,
+    y = "WAIC",
+    title = "Model comparison: WAIC",
+    subtitle = "Lower is better; models accounting for overdispersion should win"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(size = 11)
+  )
+```
+
+**Interpretation:** The Poisson model without overdispersion correction
+should have the highest (worst) WAIC. Both the negative binomial and
+OLRE approaches should substantially improve predictive performance.
+The relative ranking of negative binomial vs OLRE depends on whether the
+mean-variance relationship is better described by a quadratic (NB) or
+linear (OLRE) function.
+
+
+### Posterior predictive check
+
+A posterior predictive check compares replicated data from each model
+to the observed data. We focus on the variance statistic, which is the
+key feature that overdispersion models should capture.
+
+```{r ppc-variance, fig.width=8, fig.height=4}
+# Generate posterior predictive samples
+pp_pois <- posterior_predict(m_18a, ndraws = 500)
+pp_nb   <- posterior_predict(m_18b, ndraws = 500)
+
+obs_var <- var(quine$Days)
+
+ppc_df <- data.frame(
+  variance = c(apply(pp_pois, 1, var), apply(pp_nb, 1, var)),
+  model    = rep(c("Poisson", "Neg. Binomial"), each = 500)
+)
+
+ggplot(ppc_df, aes(x = variance)) +
+  geom_histogram(bins = 40, fill = "grey70", colour = "white") +
+  geom_vline(xintercept = obs_var, colour = "#D55E00",
+             linewidth = 1) +
+  facet_wrap(~ model, scales = "free_x") +
+  labs(
+    x = "Replicated variance", y = "Frequency",
+    title = "Posterior predictive check: variance",
+    subtitle = "Orange line = observed variance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        strip.text = element_text(face = "bold"))
+```
+
+**Interpretation:** The Poisson model generates replicated datasets
+with variance much smaller than observed. The negative binomial model
+should capture the observed variance, with the orange line falling
+within the replicated distribution.
+
+### Mean-variance relationship
+
+```{r mean-var-plot, fig.width=7, fig.height=5}
+# Group-level means and variances
+mv_df <- quine %>%
+  group_by(Eth, Sex, Age) %>%
+  summarise(
+    mean_days = mean(Days),
+    var_days  = var(Days),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 3)
+
+# Theoretical lines
+x_seq <- seq(0.1, max(mv_df$mean_days) * 1.2, length.out = 200)
+theory_df <- data.frame(
+  mean_days = rep(x_seq, 2),
+  var_days  = c(x_seq,                       # Poisson: var = mu
+                x_seq + x_seq^2 / 1.5),      # NB: var = mu + mu^2/theta
+  model     = rep(c("Poisson (Var = mu)",
+                     "NB (Var = mu + mu^2/theta)"),
+                  each = length(x_seq))
+)
+
+ggplot() +
+  geom_point(data = mv_df, aes(x = mean_days, y = var_days),
+             size = 3, alpha = 0.7, colour = "steelblue") +
+  geom_line(data = theory_df,
+            aes(x = mean_days, y = var_days, colour = model),
+            linewidth = 0.9) +
+  scale_colour_manual(values = c("Poisson (Var = mu)" = "#E69F00",
+                                  "NB (Var = mu + mu^2/theta)" = "#0072B2"),
+                      name = NULL) +
+  labs(
+    x = "Group mean",
+    y = "Group variance",
+    title = "Mean-variance relationship",
+    subtitle = "Data points should follow the NB curve if overdispersion is quadratic"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+## Part F: Frequentist comparison
+
+### Frequentist fits with glmer and glm.nb
+
+```{r freq-fits}
+# Poisson GLMM (frequentist)
+freq_pois_glmm <- glmer(
+  Days ~ Eth + Sex + Age + Lrn + (1 | Eth:Sex),
+  data   = quine,
+  family = poisson
+)
+
+# Negative binomial GLM (frequentist)
+freq_nb <- glm.nb(Days ~ Eth + Sex + Age + Lrn, data = quine)
+
+cat("Frequentist theta:", round(freq_nb$theta, 3), "\n")
+cat("Bayesian theta should be similar.\n")
+```
+
+```{r freq-comparison}
+# Compare Bayesian vs frequentist NB coefficients
+freq_coef <- coef(freq_nb)
+bayes_coef <- coef(m_18b)
+
+comp_table <- data.frame(
+  term      = names(freq_coef),
+  freq_est  = round(freq_coef, 4),
+  bayes_est = round(bayes_coef[names(freq_coef)], 4)
+)
+
+print(comp_table, row.names = FALSE)
+```
+
+**Interpretation:** With moderate sample sizes ($n = 146$), Bayesian
+and frequentist estimates should agree closely. The Bayesian approach
+provides full posterior uncertainty quantification, while the
+frequentist approach relies on asymptotic normality.
+
+
+## Practical guidelines
+
+### When to use each approach
+
+| Scenario | Recommended model | Rationale |
+|----------|------------------|-----------|
+| Var $\approx$ Mean | Poisson | Equidispersion holds |
+| Var $>$ Mean, quadratic | Negative binomial | $\text{Var} = \mu + \mu^2/\theta$ |
+| Var $>$ Mean, linear | Poisson + OLRE | $\text{Var} = \mu \cdot e^{\sigma^2}$ |
+| Small $\theta$ ($< 1$) | Negative binomial | Strong overdispersion |
+| Grouped/clustered data | GLMM (either family) | Random effects absorb heterogeneity |
+
+### Diagnostic workflow
+
+1. **Explore the data:** compute group-level means and variances; plot
+   the mean-variance relationship.
+2. **Fit the Poisson model first:** use it as a baseline and check the
+   dispersion ratio ($\hat{\phi}$).
+3. **If $\hat{\phi} > 1.5$,** fit the negative binomial and/or OLRE
+   model.
+4. **Compare models:** use WAIC and posterior predictive checks.
+5. **Interpret on the response scale:** exponentiate coefficients for
+   rate ratios.
+
+### Interpreting $\theta$
+
+The negative binomial size parameter $\theta$ controls the degree of
+overdispersion:
+
+- $\theta > 10$: mild overdispersion, Poisson is nearly adequate
+- $\theta \approx 1$--$10$: moderate overdispersion
+- $\theta < 1$: severe overdispersion; the variance is dominated by the
+  quadratic term $\mu^2 / \theta$
+
+Report $\theta$ alongside your fixed effects to document the degree of
+overdispersion in your data.
+
+
+## Summary
+
+| Model | Family | Random | Key feature |
+|-------|--------|--------|-------------|
+| `m_18a` | `poisson` | `Eth:Sex` | Baseline --- ignores overdispersion |
+| `m_18b` | `negative_binomial` | `Eth:Sex` | Adds $\theta$ for quadratic var |
+| `m_18c` | `poisson` | `Eth:Sex + obs_id` | OLRE for linear overdispersion |
+
+Key takeaways:
+
+1. Always check for overdispersion before interpreting a Poisson model.
+   The dispersion ratio $\hat{\phi}$ and the variance-to-mean ratio
+   are quick diagnostics.
+2. The negative binomial model is the most common remedy for
+   overdispersion, adding a single parameter $\theta$ that controls the
+   quadratic mean-variance relationship.
+3. Observation-level random effects (OLRE) provide an alternative within
+   the Poisson framework, inducing a lognormal-Poisson mixture with a
+   linear mean-variance relationship.
+4. Use WAIC for model comparison: it is fully Bayesian and valid across
+   different likelihoods.
+5. Posterior predictive checks (variance, zero proportion) reveal
+   whether the model captures key data features.
+6. Bayesian and frequentist negative binomial estimates should agree
+   closely with moderate sample sizes, but the Bayesian approach
+   provides honest uncertainty quantification via the full posterior.
+7. Always report coefficients as rate ratios (exponentiated) for
+   interpretability in count data models.

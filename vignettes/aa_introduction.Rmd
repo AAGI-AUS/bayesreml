@@ -1,0 +1,502 @@
+---
+title: "Getting Started with bayesreml"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting Started with bayesreml}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Introduction
+
+**bayesreml** lets you fit Bayesian mixed models using the same formula syntax
+you already know from ASReml, but powered by [greta](https://greta-stats.org/)
+and TensorFlow for Hamiltonian Monte Carlo (HMC) sampling. If you can write an
+ASReml model, you can fit the Bayesian equivalent in one function call and then
+use the full R modelling ecosystem --- `summary()`, `emmeans`, `marginaleffects`,
+`effectsize`, `bayesplot` --- on the result.
+
+This vignette walks through:
+
+1. Installing the required software stack
+2. Fitting your first model
+3. Navigating the three-part output
+4. MCMC basics for users coming from REML
+5. A side-by-side comparison with `lme4::lmer()`
+
+## Installation
+
+### Step 1: R and system requirements
+
+bayesreml requires R >= 4.1.0. On Linux you will also need a C++ compiler and
+the system libraries that TensorFlow depends on; on macOS and Windows, pre-built
+binaries are available.
+
+### Step 2: Install greta and TensorFlow
+
+greta is the probabilistic programming engine that bayesreml uses under the
+hood. It talks to TensorFlow via the `tensorflow` R package.
+
+```{r install-greta}
+install.packages("greta")
+library(greta)
+
+# Install Python, TensorFlow and TensorFlow Probability in one step
+greta::install_greta_deps()
+```
+The `install_greta_deps()` function creates a dedicated conda/virtual
+environment, so it will not interfere with other Python installations on your
+system.
+
+**Verify the installation:**
+
+```{r check-greta}
+library(greta)
+x <- normal(0, 1)
+m <- model(x)
+draws <- mcmc(m, n_samples = 100, warmup = 100, verbose = FALSE)
+```
+
+If this runs without error, greta and TensorFlow are working.
+
+### Step 3: Install bayesreml
+
+```{r install-bayesreml}
+# From GitHub (development version)
+remotes::install_github("AAGI-Org-AU-Public/bayesreml")
+
+# Or from a local source
+install.packages("bayesreml", repos = NULL, type = "source")
+```
+
+### Step 4: Suggested packages
+
+Several downstream analysis packages are optional but highly recommended:
+
+```{r install-suggests}
+install.packages(c(
+  "emmeans",
+  "marginaleffects",
+  "effectsize",
+  "bayesplot",
+  "posterior",
+  "loo",
+  "ggplot2"
+))
+```
+
+## Your first model
+
+bayesreml ships with `met_example`, a synthetic multi-environment trial (MET)
+dataset containing yield data for 10 genotypes across 4 environments with
+3 replicates. Let us fit a simple random-intercept model for genotype.
+
+```{r first-model}
+library(bayesreml)
+data(met_example)
+dat <- met_example$dat
+
+str(dat)
+#> 'data.frame':  120 obs. of 10 variables:
+#>  $ geno   : Factor w/ 10 levels "G1","G2",...
+#>  $ env    : Factor w/ 4 levels "E1","E2",...
+#>  $ rep    : Factor w/ 3 levels "R1","R2","R3"
+#>  $ block  : Factor w/ 6 levels "B1","B2",...
+#>  $ row    : Factor ...
+#>  $ col    : Factor ...
+#>  $ yield  : num ...
+#>  $ x_cov  : num ...
+#>  $ bin_y  : int ...
+#>  $ count_y: int ...
+```
+
+Fit the model:
+
+```{r fit-first}
+fit <- bayesreml(
+  fixed     = yield ~ 1,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+```
+
+The `bayesreml()` function:
+
+1. **Parses** the formulas using ASReml conventions
+2. **Generates** greta code (printed to the console by default)
+3. **Runs** HMC sampling via `greta::mcmc()`
+4. **Post-processes** draws into a three-part result
+
+## Navigating the three-part output
+
+Every call to `bayesreml()` returns an object of class `"bayesreml"` with
+three components. This design separates concerns: a GLM-compatible interface for
+the standard R ecosystem, raw greta output for Bayesian workflows, and extras
+for diagnostics and variance-component summaries.
+
+### Part 1: `$glm` --- GLM-compatible output
+
+The `$glm` component has class `c("bayesreml_glm", "glm", "lm")`, so it works
+with any R function that expects a `glm` or `lm` object.
+
+```{r glm-component}
+# Standard summary
+summary(fit)
+
+# Posterior mean coefficients (fixed effects)
+coef(fit)
+
+# Posterior variance-covariance matrix of fixed effects
+vcov(fit)
+
+# 95% credible intervals
+confint(fit)
+
+# Fitted values and residuals
+head(fitted(fit))
+head(residuals(fit))
+```
+
+### Part 2: `$greta` --- Native greta output
+
+The `$greta` component gives you full access to the greta model and MCMC draws
+for Bayesian-specific analyses.
+
+```{r greta-component}
+# MCMC draws (coda::mcmc.list)
+fit$greta$draws
+
+# The greta model object (useful for greta::calculate())
+fit$greta$model
+
+# Named list of greta arrays (parameters)
+names(fit$greta$greta_arrays)
+
+# The evaluation environment
+ls(fit$greta$env)
+```
+
+### Part 3: `$extras` --- Diagnostics, BLUPs, variance components
+
+The `$extras` component collects everything else you might need.
+
+```{r extras-component}
+# Posterior summary table
+fit$extras$summary
+
+# Convergence diagnostics: effective sample size and Gelman-Rubin Rhat
+fit$extras$convergence$n_eff
+fit$extras$convergence$gelman
+
+# Variance components table
+fit$extras$variance_comps
+
+# BLUPs for random effects
+fit$extras$blups
+
+# Generated greta code (the exact code that was evaluated)
+cat(fit$extras$code)
+
+# Timing
+fit$extras$run_time
+```
+
+### The print method
+
+Simply printing the object gives a concise overview:
+
+```{r print-fit}
+fit
+#> Bayesian mixed model  [bayesreml]
+#> -------------------------------------------------------
+#>   Fixed  : yield ~ 1
+#>   Random : ~ geno
+#>   Family : gaussian ( identity link )
+#>   MCMC   : 4 chain(s) x 1000 samples (warmup = 500) -- 12.3 sec
+#>   Params : 3 monitored; 1 fixed, 1 random terms
+#>   Max Rhat: 1.002  [OK]
+#>   Min ESS: 1842
+#> -------------------------------------------------------
+#>   $glm    -- GLM-compatible (summary, emmeans, etc.)
+#>   $greta  -- native greta (draws, model, calculate)
+#>   $extras -- diagnostics, BLUPs, variance components
+```
+
+## MCMC basics for non-Bayesian users
+
+If you are coming from REML, MCMC sampling may be unfamiliar. Here is a brief
+primer on the key concepts.
+
+### What MCMC does
+
+REML produces a single point estimate for each parameter ($\hat{\beta}$,
+$\hat{\sigma}^2$). MCMC instead draws many samples from the *posterior
+distribution* $p(\theta \mid y)$, giving you a full picture of uncertainty.
+
+bayesreml uses greta's implementation of **Hamiltonian Monte Carlo (HMC)**, a
+modern MCMC algorithm that uses gradient information to explore the posterior
+efficiently.
+
+### Chains
+
+Multiple independent chains start from different initial values and should all
+converge to the same distribution. Running at least 4 chains is recommended.
+
+```{r chains}
+# Default: 4 chains
+fit <- bayesreml(yield ~ 1, random = ~ geno, data = dat, chains = 4)
+```
+
+### Warmup (burn-in)
+
+The first `warmup` iterations are discarded because the sampler has not yet
+reached the stationary distribution. These iterations are also used by HMC to
+tune step sizes.
+
+### Effective sample size (ESS)
+
+Consecutive MCMC samples are autocorrelated, so 1000 draws may contain less
+information than 1000 independent samples. The **effective sample size** (ESS)
+estimates how many independent samples the chain is worth. A minimum ESS of
+400 is a common rule of thumb.
+
+```{r ess}
+# Check ESS for all parameters
+fit$extras$convergence$n_eff
+```
+
+### Rhat (Gelman-Rubin diagnostic)
+
+$\hat{R}$ compares variance *within* chains to variance *between* chains. If all
+chains have converged to the same distribution, $\hat{R} \approx 1$. Values
+above 1.05 indicate potential convergence problems.
+
+```{r rhat}
+# Check Rhat
+fit$extras$convergence$gelman
+```
+
+### Visual diagnostics
+
+Trace plots and density plots are the most informative convergence checks:
+
+```{r diagnostics-plot}
+# Built-in diagnostic plots
+plot(fit, type = "diagnostics")
+
+# Or use bayesplot directly
+library(bayesplot)
+mcmc_trace(fit$greta$draws)
+mcmc_dens_overlay(fit$greta$draws)
+```
+
+A healthy trace plot looks like a "hairy caterpillar" --- well-mixed, with no
+trends or stuck regions. The density plots from different chains should overlap
+almost perfectly.
+
+### What if convergence is poor?
+
+If $\hat{R} > 1.05$ or ESS is very low, try:
+
+1. **More warmup**: `warmup = 2000`
+2. **More samples**: `n_samples = 5000`
+3. **Rescale data**: centre and scale continuous predictors
+4. **Simplify the model**: reduce complexity, especially covariance structures
+
+```{r refit}
+fit2 <- bayesreml(
+  yield ~ 1,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 5000,
+  warmup    = 2000,
+  chains    = 4
+)
+```
+
+## Comparison with lme4
+
+To build intuition, let us fit the same model with `lme4::lmer()` and compare
+the results.
+
+### Fitting both models
+
+```{r lme4-comparison}
+library(lme4)
+
+# lme4 (REML)
+fit_lmer <- lmer(yield ~ 1 + (1 | geno), data = dat)
+
+# bayesreml (Bayesian)
+fit_bayes <- bayesreml(
+  yield ~ 1,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+```
+
+### Comparing fixed effects
+
+```{r compare-fixed}
+# lme4: intercept estimate and SE
+fixef(fit_lmer)
+#> (Intercept)
+#>       15.23
+
+# bayesreml: posterior mean and credible interval
+coef(fit_bayes)
+#> (Intercept)
+#>       15.19
+confint(fit_bayes)
+#>              2.5%  97.5%
+#> (Intercept) 13.8  16.6
+```
+
+The posterior mean from bayesreml will be close to the REML estimate, but the
+credible interval is the fully Bayesian statement: "there is a 95% probability
+that the intercept lies in [13.8, 16.6]".
+
+### Comparing variance components
+
+```{r compare-vc}
+# lme4
+VarCorr(fit_lmer)
+#>  Groups   Name        Variance Std.Dev.
+#>  geno     (Intercept) 3.98     1.995
+#>  Residual             1.02     1.010
+
+# bayesreml
+fit_bayes$extras$variance_comps
+#>   component    estimate    sd   q2.5  q97.5
+#> 1 sigma_geno     3.85  1.12   2.08   6.45
+#> 2 sigma_e        1.01  0.07   0.88   1.15
+```
+
+Notice that bayesreml provides full posterior distributions for variance
+components, including credible intervals. REML gives only point estimates (and
+approximate standard errors in ASReml, but not in lme4).
+
+### Comparing BLUPs
+
+```{r compare-blups}
+# lme4 BLUPs
+ranef(fit_lmer)$geno
+
+# bayesreml BLUPs (posterior means of random effects)
+fit_bayes$extras$blups$geno
+```
+
+The BLUPs (or more precisely, posterior means of the random effects) should be
+very similar. The Bayesian estimates may show slightly more shrinkage towards
+zero because the prior adds regularisation.
+
+### Key differences
+
+| Feature | lme4 / ASReml (REML) | bayesreml (Bayesian) |
+|---------|---------------------|---------------------|
+| **Estimation** | Maximum likelihood (REML) | Posterior sampling (HMC) |
+| **Point estimate** | MLE / REML | Posterior mean (or median) |
+| **Uncertainty** | SE, Wald CI | Full posterior, credible intervals |
+| **Variance CIs** | Approximate (profile/Wald) | Exact posterior quantiles |
+| **Small samples** | Can be anti-conservative | Naturally regularised by priors |
+| **Complex models** | Fast, but restricted structures | Flexible, but slower |
+| **Priors** | Not applicable | User-specified (defaults provided) |
+
+## Controlling priors
+
+bayesreml uses weakly informative default priors:
+- Fixed effects: $\beta_j \sim \text{Normal}(0, \sigma_{\text{fx}}^2)$ with
+  $\sigma_{\text{fx}} = 10$
+- Variance components: $\sigma_k \sim \text{Lognormal}(0, \sigma_{\text{vc}})$
+  with $\sigma_{\text{vc}} = 1$
+
+You can adjust these via `prior_fixed_sd` and `prior_vc_sd`:
+
+```{r priors}
+# Tighter prior on fixed effects (more informative)
+fit_tight <- bayesreml(
+  yield ~ 1,
+  random       = ~ geno,
+  data         = dat,
+  prior_fixed_sd = 5,
+  prior_vc_sd    = 0.5
+)
+```
+
+## Inspecting the generated code
+
+One of bayesreml's most useful features is transparency. You can see exactly
+what greta code was generated, and you can even retrieve the code without
+fitting the model:
+
+```{r return-code}
+# Just get the code, don't fit
+code <- bayesreml(
+  yield ~ 1,
+  random      = ~ geno,
+  data        = dat,
+  return_code = TRUE
+)
+cat(code)
+```
+
+This is invaluable for learning greta, for debugging, and for customising
+models beyond what the formula interface supports.
+
+## Plotting
+
+bayesreml provides several built-in plot types:
+
+```{r plotting}
+# MCMC trace and density plots
+plot(fit, type = "diagnostics")
+
+# Residuals vs fitted, QQ plot, Scale-Location, histogram
+plot(fit, type = "residuals")
+
+# Forest plot of fixed effects with credible intervals
+plot(fit, type = "effects")
+
+# Variance component estimates with credible intervals
+plot(fit, type = "variance")
+
+# Caterpillar plot of BLUPs
+plot(fit, type = "blups")
+
+# Posterior predictive check
+plot(fit, type = "pp_check")
+```
+
+## Next steps
+
+Now that you have fitted your first bayesreml model, the other vignettes in this
+package cover more advanced topics:
+
+- **ASReml Formula Syntax Reference** (`vignette("ab_asreml_syntax_guide")`) ---
+  complete guide to supported formula terms
+- **Downstream Analysis** (`vignette("ac_downstream_analysis")`) --- using
+  emmeans, marginaleffects, and effectsize
+- **Working with Native Greta Output** (`vignette("ad_greta_advanced")`) ---
+  posterior manipulation, derived quantities, bayesplot
+- **Comparing Models** (`vignette("ae_model_comparison")`) --- WAIC, LOO-CV,
+  and anova()
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

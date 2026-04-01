@@ -1,0 +1,602 @@
+---
+title: "Tutorial 20: Model Diagnostics and Validation"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 20: Model Diagnostics and Validation}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+Fitting a Bayesian mixed model is only the first step. Before interpreting
+results you must verify that the MCMC sampler has converged, that the
+posterior is well-explored, and that the model adequately describes the
+data. This tutorial provides a systematic workflow for model diagnostics
+and validation using `bayesreml`. You will learn how to:
+
+- Inspect trace plots and density plots for convergence
+- Interpret the Gelman-Rubin statistic (Rhat) and effective sample size (ESS)
+- Perform posterior predictive checks to assess model adequacy
+- Examine residual diagnostics (residuals vs fitted, Q-Q plots)
+- Conduct prior sensitivity analysis by refitting with different priors
+- Use cross-validation for out-of-sample validation
+- Diagnose and fix common MCMC problems
+
+We use the bundled `met_example` dataset throughout.
+
+## Mathematical background
+
+### Convergence diagnostics
+
+MCMC sampling produces draws
+$\{\boldsymbol{\theta}^{(1)}, \ldots, \boldsymbol{\theta}^{(T)}\}$
+from the posterior $p(\boldsymbol{\theta} \mid \mathbf{y})$. The
+Gelman-Rubin statistic $\hat{R}$ compares within-chain variance $W$
+to between-chain variance $B$:
+
+$$
+\hat{R} = \sqrt{\frac{\frac{n-1}{n} W + \frac{1}{n} B}{W}}
+$$
+
+At convergence $\hat{R} \approx 1$. Values below 1.05 are acceptable;
+above 1.10 indicates serious problems.
+
+The effective sample size (ESS) accounts for autocorrelation:
+
+$$
+\text{ESS} = \frac{T}{1 + 2 \sum_{k=1}^{K} \hat{\rho}_k}
+$$
+
+An ESS of at least 400 is a reasonable minimum for stable posterior
+summaries.
+
+### Posterior predictive checks
+
+For each posterior draw $\boldsymbol{\theta}^{(t)}$, simulate
+$\mathbf{y}^{\text{rep}(t)}$ from the likelihood and compare to
+observed data. A posterior predictive p-value
+
+$$
+p_B = \Pr\bigl(T(\mathbf{y}^{\text{rep}}) \ge T(\mathbf{y}) \mid \mathbf{y}\bigr)
+$$
+
+near 0.5 indicates good fit; near 0 or 1 suggests misspecification.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(coda)
+library(ggplot2)
+library(patchwork)
+```
+
+```{r data}
+data(met_example)
+dat <- met_example$dat
+str(dat)
+```
+
+## Part A: Fitting a baseline model
+
+```{r m20a-fit}
+fit_a <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(fit_a)
+```
+
+
+## Part B: Convergence diagnostics
+
+### B.1 Trace plots
+
+A well-mixing chain looks like a "fuzzy caterpillar" --- draws wander
+rapidly across the posterior without getting stuck or drifting.
+
+```{r m20a-trace, fig.width=8, fig.height=6}
+plot(fit_a, type = "diagnostics")
+```
+
+**What to look for:** All chains overlap thoroughly (good mixing), the
+mean and variance are stable over time (stationarity), and the chain
+does not stay at one value for many iterations (no stickiness).
+
+For more control with the `bayesplot` package:
+
+```{r m20a-bayesplot, fig.width=8, fig.height=5}
+if (requireNamespace("bayesplot", quietly = TRUE)) {
+  draws <- fit_a$greta$draws
+  bayesplot::mcmc_trace(draws, pars = names(coef(fit_a))) +
+    ggplot2::ggtitle("Trace plots: fixed effects")
+}
+```
+
+### B.2 Gelman-Rubin statistic (Rhat)
+
+```{r m20a-rhat}
+gelman_diag <- fit_a$extras$convergence$gelman
+rhat_values <- gelman_diag$psrf[, "Point est."]
+
+cat("Rhat summary:\n")
+cat("  Min:   ", round(min(rhat_values), 4), "\n")
+cat("  Median:", round(median(rhat_values), 4), "\n")
+cat("  Max:   ", round(max(rhat_values), 4), "\n")
+```
+
+```{r m20a-rhat-plot, fig.width=7, fig.height=4}
+rhat_df <- data.frame(
+  parameter = names(rhat_values),
+  rhat      = as.numeric(rhat_values)
+)
+rhat_df <- rhat_df[order(rhat_df$rhat, decreasing = TRUE), ]
+rhat_df$parameter <- factor(rhat_df$parameter,
+                             levels = rhat_df$parameter)
+
+ggplot(rhat_df, aes(x = rhat, y = parameter)) +
+  geom_point(size = 3, colour = ifelse(rhat_df$rhat < 1.05,
+                                        "#009E73", "#D55E00")) +
+  geom_vline(xintercept = 1.00, linetype = "solid", colour = "grey50") +
+  geom_vline(xintercept = 1.05, linetype = "dashed", colour = "#E69F00") +
+  geom_vline(xintercept = 1.10, linetype = "dashed", colour = "#D55E00") +
+  labs(
+    x     = expression(hat(R)),
+    y     = NULL,
+    title = "Gelman-Rubin diagnostic by parameter",
+    subtitle = "Green < 1.05 (good); orange = 1.05; red = 1.10"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+| Rhat range | Interpretation | Action |
+|:----------:|:--------------:|:------:|
+| < 1.01 | Excellent | Proceed |
+| 1.01 -- 1.05 | Acceptable | Consider longer run |
+| 1.05 -- 1.10 | Borderline | Increase warmup/n_samples |
+| > 1.10 | Poor | Diagnose before interpreting |
+
+
+### B.3 Effective sample size (ESS)
+
+```{r m20a-ess}
+ess_values <- fit_a$extras$convergence$n_eff
+
+cat("ESS summary:\n")
+cat("  Min:   ", round(min(ess_values)), "\n")
+cat("  Median:", round(median(ess_values)), "\n")
+cat("  Max:   ", round(max(ess_values)), "\n")
+
+# ESS as proportion of total draws
+total_draws <- 2000 * 4
+cat("\nMin ESS / total draws:", round(min(ess_values) / total_draws, 3), "\n")
+```
+
+```{r m20a-ess-plot, fig.width=7, fig.height=4}
+ess_df <- data.frame(
+  parameter = names(ess_values),
+  ess       = as.numeric(ess_values)
+)
+ess_df <- ess_df[order(ess_df$ess), ]
+ess_df$parameter <- factor(ess_df$parameter, levels = ess_df$parameter)
+
+ggplot(ess_df, aes(x = ess, y = parameter)) +
+  geom_point(size = 3, colour = ifelse(ess_df$ess >= 400,
+                                        "#009E73", "#D55E00")) +
+  geom_vline(xintercept = 400, linetype = "dashed", colour = "#E69F00") +
+  geom_vline(xintercept = 100, linetype = "dashed", colour = "#D55E00") +
+  labs(
+    x     = "Effective sample size",
+    y     = NULL,
+    title = "Effective sample size by parameter",
+    subtitle = "Green >= 400 (good); orange = 400; red = 100"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Tip:** ESS for variance components is often lower than for fixed
+effects due to higher autocorrelation. If ESS is low but Rhat < 1.05,
+increase `n_samples`.
+
+
+### B.4 Autocorrelation
+
+```{r m20a-acf, fig.width=8, fig.height=6}
+draws_ch1 <- as.matrix(fit_a$greta$draws[[1]])
+n_params <- min(ncol(draws_ch1), 6)
+
+par(mfrow = c(2, 3), mar = c(4, 4, 2, 1))
+for (i in seq_len(n_params)) {
+  acf(draws_ch1[, i], lag.max = 40,
+      main = colnames(draws_ch1)[i], cex.main = 0.9)
+}
+```
+
+
+## Part C: Posterior predictive checks
+
+### C.1 Built-in check
+
+```{r m20a-ppcheck, fig.width=8, fig.height=4}
+plot(fit_a, type = "pp_check")
+```
+
+This produces observed vs predicted values and a density overlay.
+Points should scatter around the 1:1 line; the predicted density should
+approximate the observed density.
+
+### C.2 Test statistic checks
+
+```{r m20a-ppc-stats, fig.width=8, fig.height=6}
+y_obs <- fit_a$glm$y
+y_fitted <- fitted(fit_a)
+
+# Estimate residual SD from posterior draws
+all_draws <- do.call(rbind, lapply(fit_a$greta$draws, as.matrix))
+sigma_cols <- grep("^sigma_e_atg", colnames(all_draws), value = TRUE)
+sigma_draws <- if (length(sigma_cols) > 0) {
+  all_draws[, sigma_cols[1]]
+} else {
+  rep(sd(y_obs - y_fitted), nrow(all_draws))
+}
+
+# Simulate replicated datasets
+n_rep <- min(nrow(all_draws), 500)
+set.seed(42)
+idx <- sample(nrow(all_draws), n_rep)
+
+rep_mean <- rep_sd <- rep_min <- rep_max <- numeric(n_rep)
+for (i in seq_len(n_rep)) {
+  y_rep <- rnorm(length(y_fitted), mean = y_fitted,
+                 sd = sigma_draws[idx[i]])
+  rep_mean[i] <- mean(y_rep)
+  rep_sd[i]   <- sd(y_rep)
+  rep_min[i]  <- min(y_rep)
+  rep_max[i]  <- max(y_rep)
+}
+
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+hist(rep_mean, breaks = 30, col = "lightblue", border = "white",
+     main = "PPC: Mean", xlab = "Mean of y_rep")
+abline(v = mean(y_obs), col = "red", lwd = 2, lty = 2)
+
+hist(rep_sd, breaks = 30, col = "lightblue", border = "white",
+     main = "PPC: SD", xlab = "SD of y_rep")
+abline(v = sd(y_obs), col = "red", lwd = 2, lty = 2)
+
+hist(rep_min, breaks = 30, col = "lightblue", border = "white",
+     main = "PPC: Minimum", xlab = "Min of y_rep")
+abline(v = min(y_obs), col = "red", lwd = 2, lty = 2)
+
+hist(rep_max, breaks = 30, col = "lightblue", border = "white",
+     main = "PPC: Maximum", xlab = "Max of y_rep")
+abline(v = max(y_obs), col = "red", lwd = 2, lty = 2)
+```
+
+```{r m20a-ppc-pvalues}
+cat("Posterior predictive p-values:\n")
+cat("  Mean:", round(mean(rep_mean >= mean(y_obs)), 3), "\n")
+cat("  SD:  ", round(mean(rep_sd >= sd(y_obs)), 3), "\n")
+cat("  Min: ", round(mean(rep_min <= min(y_obs)), 3), "\n")
+cat("  Max: ", round(mean(rep_max >= max(y_obs)), 3), "\n")
+cat("\nValues near 0.5 = good calibration; near 0 or 1 = misfit.\n")
+```
+
+
+## Part D: Residual diagnostics
+
+```{r m20a-resid, fig.width=8, fig.height=6}
+plot(fit_a, type = "residuals")
+```
+
+The four panels show: (1) residuals vs fitted --- check for non-linearity
+and heteroscedasticity; (2) normal Q-Q --- residuals should follow the
+reference line; (3) scale-location --- LOWESS should be flat;
+(4) residual histogram --- should be symmetric.
+
+```{r m20a-resid-by-env, fig.width=8, fig.height=4}
+resid_df <- data.frame(
+  residual = residuals(fit_a),
+  fitted   = fitted(fit_a),
+  env      = dat$env,
+  geno     = dat$geno
+)
+
+ggplot(resid_df, aes(x = env, y = residual)) +
+  geom_boxplot(fill = "lightblue", outlier.shape = 21) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(x = "Environment", y = "Residual",
+       title = "Residuals by environment") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+## Part E: Fixed effects, variance components, and BLUPs
+
+```{r m20a-effects, fig.width=7, fig.height=4}
+plot(fit_a, type = "effects")
+```
+
+```{r m20a-variance, fig.width=7, fig.height=4}
+plot(fit_a, type = "variance")
+```
+
+```{r m20a-blups, fig.width=7, fig.height=5}
+plot(fit_a, type = "blups")
+```
+
+
+## Part F: Prior sensitivity analysis
+
+The default `prior_fixed_sd = 10` is weakly informative. To check
+sensitivity, refit with tighter and wider priors:
+
+```{r m20f-prior-fixed}
+fit_tight <- bayesreml(
+  fixed = yield ~ env, random = ~ geno, data = dat,
+  n_samples = 2000, warmup = 1000, chains = 4,
+  prior_fixed_sd = 1, verbose = FALSE, mcmc_verbose = FALSE
+)
+
+fit_wide <- bayesreml(
+  fixed = yield ~ env, random = ~ geno, data = dat,
+  n_samples = 2000, warmup = 1000, chains = 4,
+  prior_fixed_sd = 100, verbose = FALSE, mcmc_verbose = FALSE
+)
+```
+
+```{r m20f-prior-compare, fig.width=8, fig.height=5}
+beta_tight   <- coef(fit_tight)
+beta_default <- coef(fit_a)
+beta_wide    <- coef(fit_wide)
+
+ci_tight   <- confint(fit_tight)
+ci_default <- confint(fit_a)
+ci_wide    <- confint(fit_wide)
+
+compare_df <- data.frame(
+  parameter = rep(names(beta_default), 3),
+  estimate  = c(beta_tight, beta_default, beta_wide),
+  lower     = c(ci_tight[, 1], ci_default[, 1], ci_wide[, 1]),
+  upper     = c(ci_tight[, 2], ci_default[, 2], ci_wide[, 2]),
+  prior     = rep(c("Tight (sd=1)", "Default (sd=10)", "Wide (sd=100)"),
+                  each = length(beta_default))
+)
+compare_df$prior <- factor(compare_df$prior,
+                            levels = c("Tight (sd=1)",
+                                       "Default (sd=10)",
+                                       "Wide (sd=100)"))
+
+ggplot(compare_df, aes(x = estimate, y = parameter,
+                        colour = prior, shape = prior)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2,
+                 position = position_dodge(width = 0.4)) +
+  scale_colour_manual(values = c("#D55E00", "#0072B2", "#009E73")) +
+  labs(x = "Posterior estimate", y = NULL,
+       colour = "Prior SD", shape = "Prior SD",
+       title = "Prior sensitivity: fixed effects",
+       subtitle = "Overlapping CrIs indicate robustness") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+```{r m20f-prior-vc}
+fit_vc_tight <- bayesreml(
+  fixed = yield ~ env, random = ~ geno, data = dat,
+  n_samples = 2000, warmup = 1000, chains = 4,
+  prior_vc_sd = 0.25, verbose = FALSE, mcmc_verbose = FALSE
+)
+
+fit_vc_wide <- bayesreml(
+  fixed = yield ~ env, random = ~ geno, data = dat,
+  n_samples = 2000, warmup = 1000, chains = 4,
+  prior_vc_sd = 3, verbose = FALSE, mcmc_verbose = FALSE
+)
+
+cat("Variance components under different VC priors:\n\n")
+cat("Tight (prior_vc_sd = 0.25):\n")
+print(fit_vc_tight$extras$variance_comps[, c("component", "estimate", "q2.5", "q97.5")])
+cat("\nDefault (prior_vc_sd = 1):\n")
+print(fit_a$extras$variance_comps[, c("component", "estimate", "q2.5", "q97.5")])
+cat("\nWide (prior_vc_sd = 3):\n")
+print(fit_vc_wide$extras$variance_comps[, c("component", "estimate", "q2.5", "q97.5")])
+```
+
+**Interpretation:** If posteriors are nearly identical across prior
+specifications, the data dominate the prior and results are robust.
+
+
+## Part G: A more complex model
+
+```{r m20g-fit}
+fit_b <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ geno + geno:env,
+  data      = dat,
+  n_samples = 3000,
+  warmup    = 1500,
+  chains    = 4
+)
+
+summary(fit_b)
+```
+
+```{r m20g-convergence}
+conv_b <- fit_b$extras$convergence
+rhat_b <- conv_b$gelman$psrf[, "Point est."]
+ess_b  <- conv_b$n_eff
+
+cat("Model B: Rhat", round(min(rhat_b), 3), "-",
+    round(max(rhat_b), 3), "\n")
+cat("Model B: ESS ", round(min(ess_b)), "-",
+    round(max(ess_b)), "\n")
+
+problem_rhat <- names(rhat_b)[rhat_b > 1.05]
+if (length(problem_rhat) > 0) {
+  cat("\nParameters with Rhat > 1.05:\n")
+  print(round(rhat_b[problem_rhat], 3))
+} else {
+  cat("All parameters have Rhat < 1.05.\n")
+}
+```
+
+```{r m20g-diag, fig.width=8, fig.height=6}
+plot(fit_b, type = "diagnostics")
+```
+
+```{r m20g-ppcheck, fig.width=8, fig.height=4}
+plot(fit_b, type = "pp_check")
+```
+
+```{r m20g-compare}
+anova(fit_a, fit_b)
+```
+
+
+## Part H: Cross-validation
+
+Leave-one-environment-out cross-validation provides an honest assessment
+of out-of-sample predictive accuracy:
+
+```{r m20h-cv}
+envs <- levels(dat$env)
+cv_results <- data.frame(fold = character(0), rmse = numeric(0),
+                          mae = numeric(0), cor = numeric(0))
+
+for (k in seq_along(envs)) {
+  train_data <- dat[dat$env != envs[k], ]
+  test_data  <- dat[dat$env == envs[k], ]
+
+  fit_cv <- bayesreml(
+    fixed = yield ~ env, random = ~ geno, data = train_data,
+    n_samples = 1000, warmup = 500, chains = 2,
+    verbose = FALSE, mcmc_verbose = FALSE
+  )
+
+  y_pred <- predict(fit_cv, newdata = test_data, type = "response")
+  y_true <- test_data$yield
+
+  cv_results <- rbind(cv_results, data.frame(
+    fold = envs[k],
+    rmse = sqrt(mean((y_true - y_pred)^2, na.rm = TRUE)),
+    mae  = mean(abs(y_true - y_pred), na.rm = TRUE),
+    cor  = cor(y_true, y_pred, use = "complete.obs")
+  ))
+}
+
+print(cv_results)
+cat("\nOverall CV RMSE:", round(mean(cv_results$rmse), 3), "\n")
+```
+
+```{r m20h-cv-plot, fig.width=7, fig.height=4}
+ggplot(cv_results, aes(x = fold, y = rmse)) +
+  geom_col(fill = "#0072B2", alpha = 0.8, width = 0.5) +
+  geom_hline(yintercept = mean(cv_results$rmse), linetype = "dashed",
+             colour = "#D55E00") +
+  labs(x = "Held-out environment", y = "RMSE",
+       title = "Leave-one-environment-out cross-validation",
+       subtitle = "Dashed line = overall mean RMSE") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+## Part I: Fixing common MCMC problems
+
+### Poor mixing (low ESS)
+
+```{r m20i-fix-mixing}
+# Solution: run longer chains
+fit_longer <- update(fit_a, n_samples = 5000, warmup = 2500)
+
+cat("Min ESS (original):", round(min(fit_a$extras$convergence$n_eff)), "\n")
+cat("Min ESS (longer):  ", round(min(fit_longer$extras$convergence$n_eff)), "\n")
+```
+
+Other solutions: increase warmup, use more informative priors,
+centre covariates, or reduce model complexity.
+
+### Non-convergence (high Rhat)
+
+```{r m20i-fix-convergence}
+# Solution 1: more warmup
+fit_more_warmup <- update(fit_a, warmup = 3000, n_samples = 2000)
+
+# Solution 2: more chains (helps detect multimodality)
+fit_more_chains <- bayesreml(
+  fixed = yield ~ env, random = ~ geno, data = dat,
+  n_samples = 2000, warmup = 1000, chains = 6,
+  verbose = FALSE, mcmc_verbose = FALSE
+)
+```
+
+### Poor posterior predictive performance
+
+If observed data falls in the tails of the posterior predictive
+distribution, consider:
+
+- A different error distribution (`family = "gamma"` for positive-skewed
+  data)
+- Additional random effects (e.g., `geno:env`)
+- Heterogeneous variance with `rcov = ~ at(env):units`
+- Including omitted covariates
+
+
+## Diagnostics workflow summary
+
+```
+1. Fit model
+2. Check Rhat  --> Any > 1.10? Increase warmup/chains
+3. Check ESS   --> Any < 100?  Run longer chains
+4. Trace plots  --> Stickiness? Reparameterise
+5. PPC          --> p near 0/1? Revise model
+6. Residuals    --> Non-normal? Change family
+7. Prior check  --> Sensitive?  Justify or get more data
+```
+
+| Diagnostic | Function / Access | What to check |
+|:-----------|:-----------------|:--------------|
+| Trace plots | `plot(fit, type = "diagnostics")` | Mixing, stationarity |
+| Rhat | `fit$extras$convergence$gelman` | All < 1.05 |
+| ESS | `fit$extras$convergence$n_eff` | All > 400 |
+| PPC | `plot(fit, type = "pp_check")` | Observed ~ predicted |
+| Residuals | `plot(fit, type = "residuals")` | Normality, homoscedasticity |
+| Fixed effects | `plot(fit, type = "effects")` | CrI width |
+| Variance | `plot(fit, type = "variance")` | Relative magnitudes |
+| BLUPs | `plot(fit, type = "blups")` | Shrinkage pattern |
+| Model comparison | `anova(fit_a, fit_b)` | DIC difference |
+| Prior sensitivity | Refit with different `prior_*_sd` | Posterior stability |
+| Cross-validation | Manual k-fold | Out-of-sample RMSE |
+
+Key takeaways:
+
+1. **Always check convergence before interpreting results.** Rhat and
+   ESS are the minimum; trace plots provide visual confirmation.
+2. **Posterior predictive checks** reveal model misspecification that
+   residual plots alone might miss.
+3. **Prior sensitivity analysis** is essential for parameters with
+   limited data support.
+4. **Cross-validation** provides honest out-of-sample assessment
+   not inflated by in-sample fit.
+5. **Residual diagnostics** remain useful in Bayesian settings for
+   detecting non-normality, heteroscedasticity, and outliers.
+6. **When diagnostics reveal problems**, run longer chains, increase
+   warmup, use more informative priors, or revise the model.
+7. All diagnostic information lives in `$extras$convergence` and
+   `$greta$draws`, making these checks straightforward for any model.

@@ -1,0 +1,466 @@
+---
+title: "Tutorial 7: Multivariate Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 7: Multivariate Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Multivariate mixed models analyse several response variables simultaneously,
+estimating covariance structures among traits at each random-effect level.
+This is essential in plant and animal breeding (genetic correlations), in
+ecology (species co-occurrence), and whenever the correlation between traits
+is scientifically informative.
+
+This tutorial covers three formulations:
+
+| Model | Description | Key syntax |
+|-------|------------|-----------|
+| m_7a  | Bivariate random intercepts | `cbind(yield, x_cov) ~ ...` |
+| m_7b  | Structured residual correlation | `rcov = ~ us(trait):units` |
+| m_7c  | Common + trait-specific random effects | `random = ~ us(trait):geno + diag(trait):env` |
+
+**Dataset.** We use the bundled `met_example` dataset, which contains two
+continuous responses (`yield` and `x_cov`) measured on 10 genotypes in 4
+environments with 3 replicates. We also show how to use `agridat::crossa.wheat`
+for a larger example.
+
+**Prerequisites:**
+
+```{r prereqs}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(corrplot)
+```
+
+
+## 1. Data Preparation
+
+### 1.1 Using met_example
+
+```{r data-met}
+data(met_example)
+dat <- met_example$dat
+
+# Inspect the two response variables
+summary(dat[, c("yield", "x_cov")])
+
+# Quick correlation
+cor(dat$yield, dat$x_cov)
+```
+
+### 1.2 Long-Format Stacking
+
+Multivariate models in `bayesreml` can be specified in two ways:
+
+1. **Wide format** with `cbind()` on the left-hand side (preferred for 2--3
+   traits).
+2. **Long (stacked) format** with a `trait` factor column, which mirrors
+   the ASReml approach and scales to many traits.
+
+```{r stack}
+dat_long <- dat %>%
+  pivot_longer(
+    cols      = c(yield, x_cov),
+    names_to  = "trait",
+    values_to = "y"
+  ) %>%
+  mutate(trait = factor(trait, levels = c("yield", "x_cov")))
+
+head(dat_long)
+```
+
+
+## 2. Mathematical Background
+
+### 2.1 Bivariate Mixed Model
+
+For two traits $y_1$ and $y_2$ measured on the same experimental units, the
+bivariate model is:
+
+$$
+\begin{bmatrix} \mathbf{y}_1 \\ \mathbf{y}_2 \end{bmatrix}
+= \begin{bmatrix} \mathbf{X}_1 & \mathbf{0} \\
+                   \mathbf{0} & \mathbf{X}_2 \end{bmatrix}
+  \begin{bmatrix} \boldsymbol{\beta}_1 \\ \boldsymbol{\beta}_2 \end{bmatrix}
++ \begin{bmatrix} \mathbf{Z}_1 & \mathbf{0} \\
+                   \mathbf{0} & \mathbf{Z}_2 \end{bmatrix}
+  \begin{bmatrix} \mathbf{u}_1 \\ \mathbf{u}_2 \end{bmatrix}
++ \begin{bmatrix} \mathbf{e}_1 \\ \mathbf{e}_2 \end{bmatrix}
+$$
+
+### 2.2 Unstructured Covariance
+
+The random effects share an unstructured (co)variance:
+
+$$
+\text{Var}\begin{pmatrix} \mathbf{u}_1 \\ \mathbf{u}_2 \end{pmatrix}
+= \mathbf{G} \otimes \mathbf{I}_q
+= \begin{bmatrix} \sigma_{u_1}^2 & \sigma_{u_{12}} \\
+                   \sigma_{u_{12}} & \sigma_{u_2}^2 \end{bmatrix}
+  \otimes \mathbf{I}_q
+$$
+
+The genetic correlation is:
+
+$$
+r_g = \frac{\sigma_{u_{12}}}{\sigma_{u_1} \, \sigma_{u_2}}
+$$
+
+Similarly, the residual covariance can be unstructured:
+
+$$
+\text{Var}\begin{pmatrix} \mathbf{e}_1 \\ \mathbf{e}_2 \end{pmatrix}
+= \mathbf{R} \otimes \mathbf{I}_n
+= \begin{bmatrix} \sigma_{e_1}^2 & \sigma_{e_{12}} \\
+                   \sigma_{e_{12}} & \sigma_{e_2}^2 \end{bmatrix}
+  \otimes \mathbf{I}_n
+$$
+
+### 2.3 Bayesian Priors
+
+In a Bayesian framework, the $2 \times 2$ covariance matrix $\mathbf{G}$ is
+typically given an inverse-Wishart or LKJ-decomposition prior. `bayesreml`
+uses the LKJ decomposition by default:
+
+$$
+\mathbf{G} = \text{diag}(\boldsymbol{\sigma}) \; \mathbf{\Omega} \; \text{diag}(\boldsymbol{\sigma})
+$$
+
+where $\mathbf{\Omega} \sim \text{LKJ}(\eta)$ and each
+$\sigma_t \sim \text{half-}t(\nu)$.
+
+
+## 3. Model 7a: Bivariate Random Intercepts
+
+The simplest multivariate model treats genotype as a random effect with an
+unstructured $2 \times 2$ covariance across traits.
+
+```{r m7a-fit}
+m_7a <- bayesreml(
+  fixed     = cbind(yield, x_cov) ~ env,
+  random    = ~ us(trait):geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_7a)
+```
+
+### 3.1 Inspect Generated Code
+
+```{r m7a-code}
+cat(m_7a$extras$code)
+```
+
+### 3.2 Convergence Diagnostics
+
+```{r m7a-diag}
+mcmc_trace(m_7a$greta$draws, regex_pars = "sigma|corr")
+mcmc_dens_overlay(m_7a$greta$draws, regex_pars = "corr")
+```
+
+### 3.3 Genetic Correlation Posterior
+
+The posterior distribution of $r_g$ is the primary quantity of interest.
+
+```{r m7a-rg}
+# Extract posterior samples of the genetic correlation
+rg_samples <- as.matrix(m_7a$greta$draws)[, "corr_geno[1,2]"]
+
+rg_df <- data.frame(rg = rg_samples)
+
+ggplot(rg_df, aes(x = rg)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(colour = "darkblue", linewidth = 1) +
+  geom_vline(xintercept = median(rg_samples), linetype = "dashed",
+             colour = "red") +
+  labs(
+    title    = "Posterior distribution of genetic correlation (r_g)",
+    subtitle = paste0("Median = ", round(median(rg_samples), 3),
+                      ", 95% CrI = [",
+                      round(quantile(rg_samples, 0.025), 3), ", ",
+                      round(quantile(rg_samples, 0.975), 3), "]"),
+    x = expression(r[g]), y = "Density"
+  ) +
+  theme_minimal()
+```
+
+A strong positive $r_g$ implies that indirect selection on one trait
+will produce a correlated response in the other.
+
+
+## 4. Model 7b: Structured Residual Correlation
+
+By default, `bayesreml` assumes independent residuals across traits. Model
+7b estimates a residual correlation via `us(trait):units` in the `rcov`
+formula.
+
+```{r m7b-fit}
+m_7b <- bayesreml(
+  fixed     = cbind(yield, x_cov) ~ env,
+  random    = ~ us(trait):geno,
+  rcov      = ~ us(trait):units,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_7b)
+```
+
+### 4.1 Residual Correlation Posterior
+
+```{r m7b-re}
+re_samples <- as.matrix(m_7b$greta$draws)[, "corr_resid[1,2]"]
+
+cat("Residual correlation:\n")
+cat("  Median:", round(median(re_samples), 3), "\n")
+cat("  95% CrI: [", round(quantile(re_samples, 0.025), 3), ",",
+    round(quantile(re_samples, 0.975), 3), "]\n")
+```
+
+### 4.2 Model Comparison
+
+```{r m7b-waic}
+# Compare residual structures via WAIC
+data.frame(
+  Model = c("m_7a (diag R)", "m_7b (us R)"),
+  WAIC  = c(m_7a$extras$waic$waic, m_7b$extras$waic$waic)
+)
+```
+
+
+## 5. Model 7c: Common + Trait-Specific Random Effects
+
+In breeding applications, some random effects (e.g., environment) may affect
+all traits similarly, while genotype effects are trait-specific. We model
+this by combining `us(trait):geno` (unstructured across traits) with
+`diag(trait):env` (independent, trait-specific environmental variances).
+
+```{r m7c-fit}
+m_7c <- bayesreml(
+  fixed     = cbind(yield, x_cov) ~ 1,
+  random    = ~ us(trait):geno + diag(trait):env,
+  rcov      = ~ us(trait):units,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_7c)
+```
+
+### 5.1 Variance Components Table
+
+```{r m7c-vc}
+m_7c$extras$variance_comps
+```
+
+
+## 6. Bivariate BLUP Scatter Plot
+
+A scatter plot of genotype BLUPs for the two traits, with the genetic
+correlation ellipse, visualises the joint genotype ranking.
+
+```{r blup-scatter}
+blups <- m_7c$extras$blups
+
+# Extract genotype BLUPs for each trait
+blup_wide <- blups %>%
+  filter(term == "geno") %>%
+  select(level, trait, estimate) %>%
+  pivot_wider(names_from = trait, values_from = estimate)
+
+ggplot(blup_wide, aes(x = yield, y = x_cov)) +
+  geom_point(size = 3, colour = "steelblue") +
+  ggrepel::geom_text_repel(aes(label = level), size = 3) +
+  stat_ellipse(level = 0.95, colour = "grey50", linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  labs(
+    title = "Bivariate genotype BLUPs with 95% ellipse",
+    x     = "BLUP for yield",
+    y     = "BLUP for x_cov"
+  ) +
+  theme_minimal()
+```
+
+
+## 7. Index Selection
+
+A selection index combines multiple trait BLUPs using economic weights. The
+multivariate model provides the genetic (co)variance matrix needed to
+compute the optimal index.
+
+```{r index}
+# Economic weights: e.g., yield is 3x more important than x_cov
+w <- c(yield = 3.0, x_cov = 1.0)
+
+# Genetic covariance matrix (posterior mean)
+G_hat <- m_7c$extras$variance_comps %>%
+  filter(grepl("geno", term)) %>%
+  pull(estimate)
+
+# Simple index = weighted sum of BLUPs
+blup_wide <- blup_wide %>%
+  mutate(index = w["yield"] * yield + w["x_cov"] * x_cov) %>%
+  arrange(desc(index))
+
+print(blup_wide)
+
+# Visualise selection frontier
+ggplot(blup_wide, aes(x = yield, y = x_cov)) +
+  geom_point(aes(colour = index), size = 4) +
+  scale_colour_viridis_c(name = "Index") +
+  ggrepel::geom_text_repel(aes(label = level), size = 3) +
+  labs(
+    title = "Selection index ranking of genotypes",
+    x     = "BLUP for yield",
+    y     = "BLUP for x_cov"
+  ) +
+  theme_minimal()
+```
+
+
+## 8. Correlated Response to Selection
+
+The expected correlated response in trait 2 when selecting on trait 1 is
+(Falconer & Mackay 1996):
+
+$$
+CR_2 = i \; h_1 \; r_g \; \sigma_{u_2}
+$$
+
+where $i$ is the selection intensity, $h_1$ is the square root of the
+heritability of trait 1, $r_g$ is the genetic correlation, and
+$\sigma_{u_2}$ is the genetic standard deviation of trait 2.
+
+```{r corr-response}
+# Posterior samples for computing correlated response
+draws_mat <- as.matrix(m_7c$greta$draws)
+
+i_sel <- 1.4  # ~20% selected
+
+# Extract relevant variance parameters (names will depend on model)
+sigma_g1 <- sqrt(draws_mat[, "var_geno_yield"])
+sigma_g2 <- sqrt(draws_mat[, "var_geno_x_cov"])
+sigma_e1 <- sqrt(draws_mat[, "var_resid_yield"])
+rg       <- draws_mat[, "corr_geno[1,2]"]
+
+h1 <- sigma_g1 / sqrt(sigma_g1^2 + sigma_e1^2)
+
+CR2 <- i_sel * h1 * rg * sigma_g2
+
+cat("Correlated response in x_cov when selecting on yield:\n")
+cat("  Median:", round(median(CR2), 3), "\n")
+cat("  95% CrI: [", round(quantile(CR2, 0.025), 3), ",",
+    round(quantile(CR2, 0.975), 3), "]\n")
+```
+
+
+## 9. Using agridat::crossa.wheat
+
+For a larger multivariate example, `agridat::crossa.wheat` provides grain
+yield for 18 wheat genotypes across 50+ environments. One can construct a
+bivariate analysis by splitting environments into two mega-environments.
+
+```{r crossa}
+library(agridat)
+data(crossa.wheat)
+
+# Select two environments as "traits"
+cw <- crossa.wheat %>%
+  filter(loc %in% c("AK", "BJ")) %>%
+  pivot_wider(names_from = loc, values_from = yield) %>%
+  drop_na()
+
+m_crossa <- bayesreml(
+  fixed     = cbind(AK, BJ) ~ 1,
+  random    = ~ us(trait):gen,
+  data      = cw,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_crossa)
+```
+
+
+## 10. Limitations and Practical Advice
+
+Multivariate models in `bayesreml` have some important considerations:
+
+1. **Dimensionality.** The number of parameters in $\mathbf{G}$ grows as
+   $t(t+1)/2$ where $t$ is the number of traits. Beyond 4--5 traits,
+   consider structured covariance models (e.g., factor-analytic).
+
+2. **Balance.** The model works best when all traits are observed on the
+   same units. Missing-trait patterns require explicit handling (e.g., by
+   stacking with `NA`s for missing traits in the long format).
+
+3. **Scale.** Traits on very different scales can cause mixing problems.
+   Consider standardising responses before fitting.
+
+4. **Convergence.** Multivariate models are more demanding. Increase
+   `warmup` and `n_samples` relative to univariate models, and always
+   inspect trace plots for the correlation parameters.
+
+5. **Interpretation.** Posterior summaries of covariance matrices should be
+   reported on the correlation scale for interpretability. Covariance
+   components are harder to compare across studies.
+
+
+## 11. Summary
+
+| Model | Random | Rcov | Key quantity |
+|-------|--------|------|-------------|
+| m_7a  | `us(trait):geno` | `~ units` (diag) | Genetic correlation |
+| m_7b  | `us(trait):geno` | `~ us(trait):units` | Residual correlation |
+| m_7c  | `us(trait):geno + diag(trait):env` | `~ us(trait):units` | Partitioned VC |
+
+**Key take-aways:**
+
+1. Multivariate models jointly estimate genetic and residual (co)variances,
+   enabling computation of genetic correlations and selection indices.
+2. The `us(trait)` structure estimates an unstructured covariance matrix;
+   `diag(trait)` restricts to independent, trait-specific variances.
+3. Bayesian estimation provides full posterior distributions for genetic
+   correlations, enabling direct probabilistic statements.
+4. Selection indices and correlated responses are natural by-products of
+   multivariate analysis.
+5. Scale responses carefully and monitor convergence for correlation
+   parameters.
+
+
+## References
+
+- Falconer, D. S. & Mackay, T. F. C. (1996). *Introduction to Quantitative
+  Genetics* (4th ed.). Longman.
+- Henderson, C. R. & Quaas, R. L. (1976). Multiple trait evaluation using
+  relatives' records. *Journal of Animal Science*, 43, 1188--1197.
+- Smith, A. B., Cullis, B. R. & Thompson, R. (2001). Analysing variety by
+  environment data using multiplicative mixed models and adjustments for
+  spatial field trend. *Biometrics*, 57, 1138--1147.

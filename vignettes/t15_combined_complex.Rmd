@@ -1,0 +1,752 @@
+---
+title: "Tutorial 15: Combined Complex Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 15: Combined Complex Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Real-world mixed models are rarely simple. A plant breeding trial may require
+simultaneously modelling genotype effects, spatial field trends, heterogeneous
+residual variance across environments, and genotype-by-environment interaction.
+Building such models requires a systematic workflow: start simple, add
+complexity incrementally, compare at each step, and diagnose convergence issues.
+
+This tutorial teaches that workflow using two datasets from `agridat`:
+`gilmour.serpentine` (a single trial with spatial trends) and `besag.met`
+(a multi-environment trial).
+
+**Models covered:**
+
+| Model | Components | Dataset |
+|-------|-----------|---------|
+| m_15a | Random genotype + spatial + heterogeneous residuals | gilmour.serpentine |
+| m_15b | GxE + nested blocking + spatial | besag.met |
+| m_15c | Multivariate (two traits) + spatial | gilmour.serpentine |
+| m_15d | Full model (all components combined) | besag.met |
+
+**Learning objectives:**
+
+- Incremental model building strategy
+- WAIC/DIC comparison at each step
+- Diagnosing convergence in complex models
+- MCMC tuning guidance
+- Multi-panel diagnostic dashboards
+
+**Packages required:**
+
+```{r packages}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(agridat)
+library(Matrix)
+library(bayesplot)
+library(patchwork)
+```
+
+---
+
+## Part A: Single trial with spatial trends (gilmour.serpentine)
+
+## 1. Data preparation
+
+```{r data-gilmour}
+data(gilmour.serpentine, package = "agridat")
+gs <- gilmour.serpentine
+gs$gen  <- factor(gs$gen)
+gs$rep  <- factor(gs$rep)
+gs$row  <- as.numeric(gs$row)
+gs$col  <- as.numeric(gs$col)
+gs$row_f <- factor(gs$row)
+gs$col_f <- factor(gs$col)
+
+str(gs)
+cat("Genotypes:", nlevels(gs$gen), "\n")
+cat("Replicates:", nlevels(gs$rep), "\n")
+cat("Rows:", length(unique(gs$row)), "\n")
+cat("Columns:", length(unique(gs$col)), "\n")
+```
+
+### Field layout
+
+```{r gilmour-heatmap, fig.height = 5}
+ggplot(gs, aes(x = col, y = row, fill = yield)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Gilmour serpentine trial: raw yield",
+       x = "Column", y = "Row", fill = "Yield") +
+  coord_equal() +
+  theme_minimal()
+```
+
+The "serpentine" name refers to the harvesting pattern. Spatial trends are
+common in field trials and can bias genotype estimates if not accounted for.
+
+---
+
+## 2. Incremental model building
+
+### Step 0: Baseline model (fixed genotype only)
+
+We begin with the simplest possible model to establish a baseline:
+
+$$
+y_{ij} = \mu + g_i + \varepsilon_{ij}, \quad
+\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)
+$$
+
+```{r step0-fit}
+m_step0 <- bayesreml(
+  fixed   = yield ~ gen,
+  data    = gs,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+summary(m_step0)
+```
+
+```{r step0-resid, fig.height = 4}
+gs$resid_s0 <- residuals(m_step0)
+
+ggplot(gs, aes(x = col, y = row, fill = resid_s0)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  labs(title = "Step 0 residuals: clear spatial pattern",
+       fill = "Residual") +
+  coord_equal() + theme_minimal()
+```
+
+If residuals show spatial patterning, the model is missing a spatial component.
+
+### Step 1: Add random genotype + replicate
+
+Move genotype to random to borrow strength across the design:
+
+$$
+y_{ij} = \mu + r_j + g_i + \varepsilon_{ij}, \quad
+g_i \sim \mathcal{N}(0, \sigma_g^2)
+$$
+
+```{r step1-fit}
+m_step1 <- bayesreml(
+  fixed   = yield ~ rep,
+  random  = ~ gen,
+  data    = gs,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+summary(m_step1)
+```
+
+### Step 2: Add spatial correlation
+
+Construct a Matern spatial covariance matrix and add it:
+
+```{r step2-spatial}
+# Spatial correlation matrix
+coords <- cbind(gs$col, gs$row)
+D <- as.matrix(dist(coords))
+
+# Matern with nu = 1.5 and range estimated from data extent
+range_est <- max(D) / 5  # rough starting value
+nu <- 1.5
+scaled <- sqrt(2 * nu) * D / range_est
+scaled[scaled == 0] <- 1e-10
+R_spat <- (2^(1 - nu) / gamma(nu)) * (scaled^nu) * besselK(scaled, nu)
+diag(R_spat) <- 1
+R_spat[R_spat < 0] <- 0
+R_spat <- as.matrix(Matrix::nearPD(R_spat)$mat)
+
+gs$spat_id <- factor(seq_len(nrow(gs)))
+```
+
+```{r step2-fit}
+m_step2 <- bayesreml(
+  fixed          = yield ~ rep,
+  random         = ~ gen + vm(spat_id, Rspat),
+  data           = gs,
+  known_matrices = list(Rspat = R_spat),
+  n_samples      = 1500,
+  warmup         = 750,
+  chains         = 4
+)
+summary(m_step2)
+```
+
+### Step 3: Compare models
+
+```{r step-compare}
+anova(m_step0, m_step1, m_step2)
+```
+
+```{r step-resid-compare, fig.height = 8}
+gs$resid_s1 <- residuals(m_step1)
+gs$resid_s2 <- residuals(m_step2)
+
+resid_steps <- gs %>%
+  select(col, row, resid_s0, resid_s1, resid_s2) %>%
+  pivot_longer(starts_with("resid_"), names_to = "step",
+               values_to = "residual") %>%
+  mutate(step = recode(step,
+    resid_s0 = "Step 0: Fixed gen only",
+    resid_s1 = "Step 1: + Random gen",
+    resid_s2 = "Step 2: + Spatial"
+  ))
+
+ggplot(resid_steps, aes(x = col, y = row, fill = residual)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  facet_wrap(~ step, ncol = 1) +
+  coord_equal() +
+  labs(title = "Residual spatial patterns across model building steps",
+       fill = "Residual") +
+  theme_minimal()
+```
+
+**Decision rule:** If adding a component substantially reduces the DIC and
+visibly removes structure from the residual maps, keep it. Otherwise, favour
+the simpler model.
+
+---
+
+## 3. Model 15a: Random + spatial + heterogeneous residuals
+
+The full single-trial model adds heterogeneous residual variance by replicate
+using the `rcov` argument:
+
+```{r m15a-fit}
+m_15a <- bayesreml(
+  fixed          = yield ~ rep,
+  random         = ~ gen + vm(spat_id, Rspat),
+  rcov           = ~ at(rep):units,
+  data           = gs,
+  known_matrices = list(Rspat = R_spat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_15a)
+```
+
+### Variance components
+
+```{r m15a-vc}
+vc_15a <- m_15a$extras$variance_comps
+print(vc_15a)
+
+# Visualise
+ggplot(vc_15a, aes(x = component, y = estimate)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_errorbar(aes(ymin = q2.5, ymax = q97.5), width = 0.3) +
+  labs(title = "Model 15a: Variance components with 95% CrI",
+       x = "", y = "Variance estimate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## Part B: Multi-environment trial (besag.met)
+
+## 4. Data preparation
+
+```{r data-besag}
+data(besag.met, package = "agridat")
+bm <- besag.met
+bm$gen  <- factor(bm$gen)
+bm$env  <- factor(bm$county)
+bm$rep  <- factor(bm$rep)
+bm$row  <- as.numeric(bm$row)
+bm$col  <- as.numeric(bm$col)
+
+str(bm)
+cat("Genotypes:", nlevels(bm$gen), "\n")
+cat("Environments:", nlevels(bm$env), "\n")
+```
+
+```{r besag-heatmaps, fig.height = 6}
+ggplot(bm, aes(x = col, y = row, fill = yield)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~ env, scales = "free") +
+  labs(title = "Besag MET: yield heatmaps by environment",
+       fill = "Yield") +
+  coord_equal() +
+  theme_minimal()
+```
+
+---
+
+## 5. Model 15b: GxE + nested blocking + spatial
+
+### Incremental building for MET
+
+**Step 1: Simple GxE model**
+
+```{r met-step1}
+m_met1 <- bayesreml(
+  fixed   = yield ~ env,
+  random  = ~ gen + gen:env,
+  data    = bm,
+  n_samples = 1500,
+  warmup    = 750,
+  chains    = 4
+)
+summary(m_met1)
+```
+
+**Step 2: Add nested blocking**
+
+```{r met-step2}
+m_met2 <- bayesreml(
+  fixed   = yield ~ env,
+  random  = ~ gen + gen:env + env:rep,
+  data    = bm,
+  n_samples = 1500,
+  warmup    = 750,
+  chains    = 4
+)
+summary(m_met2)
+```
+
+**Step 3: Add within-environment spatial correlation**
+
+For multi-environment trials, the spatial correlation operates within each
+environment. We construct environment-specific spatial matrices:
+
+```{r met-spatial-construct}
+# Build per-environment spatial correlation matrices
+envs <- levels(bm$env)
+
+make_env_spatial <- function(data, env_name, range_param = 3, nu = 1.5) {
+  sub <- data[data$env == env_name, ]
+  coords <- cbind(sub$col, sub$row)
+  D <- as.matrix(dist(coords))
+  scaled <- sqrt(2 * nu) * D / range_param
+  scaled[scaled == 0] <- 1e-10
+  R <- (2^(1 - nu) / gamma(nu)) * (scaled^nu) * besselK(scaled, nu)
+  diag(R) <- 1
+  R[R < 0] <- 0
+  as.matrix(Matrix::nearPD(R)$mat)
+}
+
+# Build block-diagonal spatial matrix across environments
+bm <- bm[order(bm$env, bm$row, bm$col), ]
+bm$spat_id <- factor(seq_len(nrow(bm)))
+
+n_total <- nrow(bm)
+R_met_spat <- matrix(0, n_total, n_total)
+
+for (e in envs) {
+  idx <- which(bm$env == e)
+  R_e <- make_env_spatial(bm, e)
+  R_met_spat[idx, idx] <- R_e
+}
+```
+
+```{r m15b-fit}
+m_15b <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ gen + gen:env + env:rep + vm(spat_id, Rmet),
+  data           = bm,
+  known_matrices = list(Rmet = R_met_spat),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_15b)
+```
+
+### Model comparison across steps
+
+```{r met-compare}
+anova(m_met1, m_met2, m_15b)
+```
+
+### Which components matter most?
+
+```{r met-varpart, fig.height = 5}
+vc_15b <- m_15b$extras$variance_comps
+
+# Compute proportion of total variance
+vc_15b$proportion <- vc_15b$estimate / sum(vc_15b$estimate)
+
+ggplot(vc_15b, aes(x = reorder(component, proportion), y = proportion)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(proportion * 100, 1), "%")),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Variance component proportions (Model 15b)",
+       x = "", y = "Proportion of total variance") +
+  theme_minimal()
+```
+
+This chart answers the crucial question: *which sources of variation dominate?*
+If GxE variance is large relative to genotype variance, genotype rankings are
+unstable across environments, requiring environment-specific recommendations.
+
+---
+
+## 6. Model 15c: Multivariate (two traits) + spatial
+
+Multivariate models jointly analyse correlated traits, borrowing information
+across them. Here we demonstrate the concept using `gilmour.serpentine` yield
+with a simulated second trait.
+
+```{r m15c-setup}
+# Simulate a correlated second trait
+set.seed(42)
+gs$trait2 <- gs$yield * 0.7 + rnorm(nrow(gs), sd = 5)
+
+# For multivariate analysis, reshape to long format
+gs_long <- gs %>%
+  pivot_longer(cols = c(yield, trait2), names_to = "trait",
+               values_to = "value") %>%
+  mutate(trait = factor(trait),
+         gen_trait = interaction(gen, trait, drop = TRUE))
+```
+
+```{r m15c-fit}
+m_15c <- bayesreml(
+  fixed   = value ~ trait + trait:rep,
+  random  = ~ gen:trait,
+  data    = gs_long,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+summary(m_15c)
+```
+
+### Trait correlation
+
+```{r m15c-traicor, fig.height = 4}
+# Extract genotype BLUPs per trait
+blups_c <- m_15c$extras$blups
+blups_wide <- blups_c %>%
+  filter(grepl("gen", term)) %>%
+  mutate(
+    geno  = sub(".*\\.([^.]+)$", "\\1", level),
+    trait = sub("^([^.]+)\\..*$", "\\1", level)
+  ) %>%
+  select(geno, trait, estimate) %>%
+  pivot_wider(names_from = trait, values_from = estimate)
+
+if (ncol(blups_wide) >= 3) {
+  trait_names <- names(blups_wide)[2:3]
+  ggplot(blups_wide, aes(x = .data[[trait_names[1]]],
+                          y = .data[[trait_names[2]]])) +
+    geom_point(size = 3, colour = "steelblue") +
+    geom_smooth(method = "lm", se = FALSE, linetype = "dashed",
+                colour = "grey50") +
+    labs(title = "Genetic correlation between traits",
+         x = paste("BLUP:", trait_names[1]),
+         y = paste("BLUP:", trait_names[2])) +
+    theme_minimal()
+}
+```
+
+---
+
+## 7. Model 15d: Full model (all components)
+
+The full model combines everything: GxE interaction, nested blocking, spatial
+correlation, and heterogeneous residual variance.
+
+$$
+y_{ijkl} = \mu + E_j + R_{k(j)} + g_i + (gE)_{ij}
+            + s(\mathbf{x}_{ijkl}) + \varepsilon_{ijkl}
+$$
+
+where $\varepsilon_{ijkl} \sim \mathcal{N}(0, \sigma_{e_j}^2)$ allows
+environment-specific residual variance.
+
+```{r m15d-fit}
+m_15d <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ gen + gen:env + env:rep + vm(spat_id, Rmet),
+  rcov           = ~ at(env):units,
+  data           = bm,
+  known_matrices = list(Rmet = R_met_spat),
+  n_samples      = 3000,
+  warmup         = 1500,
+  chains         = 4
+)
+summary(m_15d)
+```
+
+---
+
+## 8. Diagnostics for complex models
+
+### Multi-panel diagnostic dashboard
+
+```{r dashboard, fig.height = 10}
+# Panel 1: Trace plots
+p1 <- bayesplot::mcmc_trace(m_15d$greta$draws,
+                             regex_pars = "sigma") +
+  ggtitle("Trace: variance parameters")
+
+# Panel 2: Density overlay
+p2 <- bayesplot::mcmc_dens_overlay(m_15d$greta$draws,
+                                    regex_pars = "sigma") +
+  ggtitle("Posterior densities by chain")
+
+# Panel 3: R-hat
+draws_mat <- do.call(rbind, lapply(m_15d$greta$draws, as.matrix))
+if (!is.null(m_15d$extras$convergence$gelman)) {
+  rhat_vals <- m_15d$extras$convergence$gelman$psrf[, "Point est."]
+  rhat_df <- data.frame(
+    parameter = names(rhat_vals),
+    rhat = rhat_vals
+  )
+  p3 <- ggplot(rhat_df, aes(x = reorder(parameter, rhat), y = rhat)) +
+    geom_point(aes(colour = rhat > 1.05), size = 2) +
+    scale_colour_manual(values = c("FALSE" = "forestgreen",
+                                   "TRUE" = "firebrick"),
+                        guide = "none") +
+    geom_hline(yintercept = 1.05, linetype = "dashed", colour = "red") +
+    coord_flip() +
+    labs(title = "R-hat convergence diagnostic", x = "", y = "R-hat") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 7))
+} else {
+  p3 <- ggplot() + annotate("text", x = 0.5, y = 0.5,
+    label = "R-hat not available") + theme_void()
+}
+
+# Panel 4: Effective sample size
+if (!is.null(m_15d$extras$convergence$n_eff)) {
+  ess_vals <- m_15d$extras$convergence$n_eff
+  ess_df <- data.frame(
+    parameter = names(ess_vals),
+    ess = ess_vals
+  )
+  p4 <- ggplot(ess_df, aes(x = reorder(parameter, ess), y = ess)) +
+    geom_col(aes(fill = ess < 400), alpha = 0.8) +
+    scale_fill_manual(values = c("FALSE" = "steelblue",
+                                 "TRUE" = "firebrick"),
+                      guide = "none") +
+    geom_hline(yintercept = 400, linetype = "dashed", colour = "red") +
+    coord_flip() +
+    labs(title = "Effective sample size",
+         subtitle = "Red = ESS < 400 (consider more samples)",
+         x = "", y = "ESS") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 7))
+} else {
+  p4 <- ggplot() + annotate("text", x = 0.5, y = 0.5,
+    label = "ESS not available") + theme_void()
+}
+
+(p1 + p2) / (p3 + p4)
+```
+
+### Convergence challenges in complex models
+
+Complex models with many variance components commonly face these issues:
+
+```{r convergence-checklist}
+# 1. Check R-hat
+rhat_max <- max(m_15d$extras$convergence$gelman$psrf[, "Point est."],
+                na.rm = TRUE)
+cat("Max R-hat:", round(rhat_max, 3), "\n")
+if (rhat_max > 1.10) {
+  cat("WARNING: R-hat > 1.10 indicates poor convergence.\n")
+  cat("Actions: increase warmup, reparameterise, or simplify model.\n")
+}
+
+# 2. Check ESS
+ess_min <- min(m_15d$extras$convergence$n_eff, na.rm = TRUE)
+cat("Min ESS:", round(ess_min, 0), "\n")
+if (ess_min < 100) {
+  cat("WARNING: ESS < 100 is critically low.\n")
+  cat("Actions: increase n_samples, improve priors.\n")
+}
+
+# 3. Check run time
+cat("Run time:", round(m_15d$extras$run_time, 1), "seconds\n")
+```
+
+---
+
+## 9. MCMC tuning guidance
+
+### When to increase samples
+
+The following decision tree guides MCMC settings:
+
+```{r tuning-guidance}
+# Recommended starting points by model complexity
+tuning_guide <- data.frame(
+  Complexity = c("Simple (1-2 random terms)",
+                  "Moderate (3-5 random terms)",
+                  "Complex (6+ random terms, spatial)",
+                  "Very complex (multivariate + spatial)"),
+  n_samples = c(1000, 2000, 3000, 5000),
+  warmup    = c(500,  1000, 1500, 2500),
+  chains    = c(4, 4, 4, 4),
+  notes     = c("Usually sufficient",
+                "Default recommendation",
+                "May need 5000+ for variance components",
+                "Consider running overnight")
+)
+print(tuning_guide)
+```
+
+### Parameterisation matters
+
+When variance components are near zero or highly correlated, consider:
+
+1. **Centring covariates** to reduce correlation between intercept and slope
+   parameters.
+
+2. **Using informative priors** when you have prior knowledge about variance
+   magnitudes. The `prior_vc_sd` argument controls the hyperparameter for
+   variance component priors.
+
+3. **Model simplification**: if a variance component's 95% CrI includes zero,
+   consider dropping it and comparing via DIC.
+
+```{r tuning-example}
+# Example: tighter priors for better convergence
+m_15d_tight <- bayesreml(
+  fixed          = yield ~ env,
+  random         = ~ gen + gen:env + env:rep + vm(spat_id, Rmet),
+  rcov           = ~ at(env):units,
+  data           = bm,
+  known_matrices = list(Rmet = R_met_spat),
+  n_samples      = 3000,
+  warmup         = 1500,
+  chains         = 4,
+  prior_vc_sd    = 2    # tighter than default
+)
+
+# Compare convergence
+cat("Default priors - Max Rhat:",
+    round(max(m_15d$extras$convergence$gelman$psrf[, 1], na.rm = TRUE), 3),
+    "\n")
+cat("Tighter priors - Max Rhat:",
+    round(max(m_15d_tight$extras$convergence$gelman$psrf[, 1], na.rm = TRUE), 3),
+    "\n")
+```
+
+---
+
+## 10. Model building strategy: a decision framework
+
+The following workflow summarises the model building approach demonstrated in
+this tutorial:
+
+### Step-by-step protocol
+
+1. **Start with fixed effects only** (Step 0). This establishes the baseline
+   and reveals residual patterns.
+
+2. **Add random effects for the primary factor of interest** (e.g., genotype).
+   Compare via DIC. Check residual spatial maps.
+
+3. **Add blocking structure** (replicates, incomplete blocks). These are
+   design features that should almost always be included.
+
+4. **Add spatial correlation** if the residual map shows spatial patterns.
+   Construct the covariance matrix, fit, and compare.
+
+5. **Add heterogeneous residuals** (`rcov = ~ at(env):units`) if working
+   across environments with different scales.
+
+6. **Add interaction terms** (GxE) if the science demands it and the data
+   support it.
+
+7. **Validate with diagnostics**: trace plots, R-hat, ESS, residual maps.
+
+### When to stop adding complexity
+
+```{r stopping-rules}
+# Decision criteria
+cat("Stop adding model components when:\n\n")
+cat("1. DIC improvement < 2 (negligible practical improvement)\n")
+cat("2. Added variance component CrI includes zero\n")
+cat("3. R-hat exceeds 1.10 (model is too complex for the data)\n")
+cat("4. ESS drops below 100 (mixing is too poor)\n")
+cat("5. Run time becomes impractical for iterative development\n")
+```
+
+### Full comparison table
+
+```{r full-comparison}
+# Single-trial models
+cat("=== Single-trial (gilmour.serpentine) ===\n")
+anova(m_step0, m_step1, m_step2, m_15a)
+
+# MET models
+cat("\n=== Multi-environment (besag.met) ===\n")
+anova(m_met1, m_met2, m_15b, m_15d)
+```
+
+---
+
+## 11. Key takeaways
+
+1. **Incremental model building** is not optional for complex models --- it is
+   the only reliable way to identify which components the data support. Jumping
+   directly to a full model risks convergence failure and makes it impossible
+   to attribute improvement to specific components.
+
+2. **Residual spatial maps** are the single most informative diagnostic for
+   field trial models. They reveal patterns that summary statistics miss.
+
+3. **DIC comparison** should be used alongside residual diagnostics, not in
+   isolation. A model can improve DIC while introducing convergence problems.
+
+4. **Variance component proportions** answer the scientific question: *what
+   drives variation in this system?* A large GxE proportion relative to
+   genotype variance implies unstable rankings.
+
+5. **MCMC tuning** is model-specific. Complex models need more warmup, more
+   samples, and sometimes tighter priors. The diagnostic dashboard (R-hat, ESS,
+   trace plots) guides these decisions.
+
+6. **The `rcov` argument** enables heterogeneous residual structures, which are
+   essential when combining data across environments with different scales or
+   precision.
+
+7. **Transparency through code**: every `bayesreml` model generates inspectable
+   greta code. For complex models, reviewing this code helps understand exactly
+   what priors and structures are being used.
+
+### Inspect the generated code for the full model
+
+```{r show-code}
+cat(m_15d$extras$code)
+```
+
+This code can be extracted, modified (e.g., to add custom priors or
+constraints), and re-run directly in greta for maximum flexibility.
+
+---
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

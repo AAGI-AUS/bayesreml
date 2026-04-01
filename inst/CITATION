@@ -1,0 +1,10 @@
+bibentry(
+  bibtype  = "Manual",
+  title    = "bayesreml: Bayesian Mixed Models with ASReml Syntax, Powered by Greta",
+  author   = c(
+    person("AAGI", "University of Adelaide")
+  ),
+  year     = "2025",
+  note     = "R package version 0.1.0",
+  url      = "https://github.com/AAGI-Org-AU-Public/bayesreml"
+)

@@ -1,0 +1,596 @@
+---
+title: "Comparing Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Comparing Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Introduction
+
+Model comparison is central to applied statistics. In the frequentist (REML)
+world, you might use likelihood ratio tests, AIC, or BIC. In the Bayesian world,
+the main tools are:
+
+- **WAIC** (Widely Applicable Information Criterion)
+- **LOO-CV** (Leave-One-Out Cross-Validation via Pareto-smoothed importance
+  sampling)
+- **DIC** (Deviance Information Criterion --- an older approach)
+- **Bayes factors** (not covered here due to computational challenges)
+
+This vignette covers:
+
+1. Theory behind WAIC and LOO-CV
+2. Using `anova()` for quick model comparison
+3. Building models incrementally
+4. Computing WAIC and LOO with the **loo** package
+5. What to do when WAIC and LOO disagree
+6. Practical guidelines
+
+We use the bundled `met_example` dataset throughout.
+
+---
+
+## Theory: Bayesian model comparison
+
+### The goal
+
+We want to assess **predictive accuracy**: how well does the model predict
+*new, unseen* observations from the same data-generating process? A model that
+fits the training data perfectly but predicts new data poorly is overfit.
+
+### Expected log predictive density (ELPD)
+
+The gold standard is the **expected log pointwise predictive density** (ELPD):
+
+$$\text{ELPD} = \sum_{i=1}^{n} \int \log p(\tilde{y}_i \mid y) \, p_t(\tilde{y}_i) \, d\tilde{y}_i$$
+
+where $p(\tilde{y}_i \mid y)$ is the posterior predictive density and
+$p_t(\tilde{y}_i)$ is the true data-generating distribution. Since $p_t$ is
+unknown, we need to estimate ELPD.
+
+### WAIC (Widely Applicable Information Criterion)
+
+WAIC estimates ELPD using the training data with a correction for the effective
+number of parameters:
+
+$$\widehat{\text{ELPD}}_{\text{WAIC}} = \text{lppd} - p_{\text{WAIC}}$$
+
+where:
+- $\text{lppd} = \sum_{i=1}^{n} \log \left( \frac{1}{S} \sum_{s=1}^{S} p(y_i \mid \theta^{(s)}) \right)$ is the log pointwise predictive density
+- $p_{\text{WAIC}} = \sum_{i=1}^{n} \text{Var}_{s}\left[\log p(y_i \mid \theta^{(s)})\right]$ is the effective number of parameters
+
+WAIC is reported on the deviance scale: $\text{WAIC} = -2 \times \widehat{\text{ELPD}}_{\text{WAIC}}$.
+
+**Lower WAIC = better predictive accuracy.**
+
+### LOO-CV (Leave-One-Out Cross-Validation)
+
+LOO-CV estimates ELPD by computing the predictive density for each observation
+$y_i$ using a posterior fitted to all other observations $y_{-i}$:
+
+$$\widehat{\text{ELPD}}_{\text{LOO}} = \sum_{i=1}^{n} \log p(y_i \mid y_{-i})$$
+
+Fitting $n$ separate models would be prohibitively expensive. The **loo**
+package uses **Pareto-smoothed importance sampling (PSIS)** to approximate
+LOO-CV from a single model fit, which is both fast and reliable.
+
+**Higher ELPD_LOO = better predictive accuracy.**
+
+### DIC (Deviance Information Criterion)
+
+DIC is an older criterion:
+
+$$\text{DIC} = -2 \log p(y \mid \hat{\theta}) + 2 p_D$$
+
+where $\hat{\theta}$ is the posterior mean and $p_D$ is the effective number
+of parameters. DIC is less principled than WAIC or LOO but is simpler to
+compute. bayesreml's `anova()` method uses an approximate DIC.
+
+---
+
+## Example dataset and models
+
+We will compare three nested models of increasing complexity using the
+`met_example` dataset:
+
+```{r setup-models}
+library(bayesreml)
+data(met_example)
+dat <- met_example$dat
+```
+
+### Model 1: Intercept only + random genotype
+
+The simplest model treats all environments as equivalent:
+
+```{r model1}
+fit1 <- bayesreml(
+  yield ~ 1,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+```
+
+### Model 2: Fixed environment + random genotype
+
+Adding environment as a fixed effect:
+
+```{r model2}
+fit2 <- bayesreml(
+  yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+```
+
+### Model 3: Fixed environment + random genotype + random G x E
+
+Adding genotype-by-environment interaction as a random effect:
+
+```{r model3}
+fit3 <- bayesreml(
+  yield ~ env,
+  random    = ~ geno + geno:env,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+```
+
+Before comparing, verify that all models have converged:
+
+```{r check-convergence}
+# Quick convergence check for each model
+fit1
+fit2
+fit3
+```
+
+---
+
+## Using `anova()` for quick comparison
+
+bayesreml provides an `anova()` method that produces a quick model comparison
+table using an approximate DIC:
+
+```{r anova-basic}
+anova(fit1, fit2, fit3)
+#> Bayesian model comparison
+#> --------------------------------------------------
+#>     Model  logLik npar    DIC delta
+#> 1 Model 1 -245.3    3  496.6 115.2
+#> 2 Model 2 -187.7    6  381.4   0.0
+#> 3 Model 3 -189.1    7  384.2   2.8
+#>
+#> Note: DIC is approximate. For rigorous comparison,
+#>  use loo::loo() on the greta draws.
+```
+
+The `delta` column shows the difference from the best (lowest DIC) model. In
+this example, Model 2 has the lowest DIC, and Model 3 is only slightly worse,
+suggesting the G x E interaction adds little to predictive accuracy beyond the
+main effects.
+
+### Interpreting the anova output
+
+| Column | Meaning |
+|--------|---------|
+| `logLik` | Approximate log-likelihood at posterior mean |
+| `npar` | Number of monitored parameters |
+| `DIC` | Deviance Information Criterion ($-2\text{logLik} + 2\text{npar}$) |
+| `delta` | Difference from the best model (0 = best) |
+
+Rules of thumb for $\Delta$DIC:
+- $\Delta < 2$: Models are essentially equivalent
+- $2 < \Delta < 7$: Some evidence for the better model
+- $\Delta > 10$: Strong evidence for the better model
+
+---
+
+## WAIC with the loo package
+
+For more rigorous comparison, use the **loo** package to compute WAIC. This
+requires the pointwise log-likelihood matrix, which you can compute from the
+posterior draws.
+
+### Computing the log-likelihood matrix
+
+```{r loglik-matrix}
+library(loo)
+
+# Function to compute pointwise log-likelihood from bayesreml fit
+compute_log_lik <- function(fit) {
+  draws <- fit$greta$draws
+  all_draws <- do.call(rbind, lapply(draws, as.matrix))
+
+  y <- fit$glm$y
+  n <- length(y)
+  S <- nrow(all_draws)
+
+  # Get fitted values for each posterior draw
+  # For Gaussian models, we need mu[i] and sigma_e for each draw
+  # This is a simplified version; in practice, you'd reconstruct
+  # the linear predictor for each draw
+
+  fitted_mean <- fitted(fit)  # posterior mean fitted values
+
+  # Get sigma_e draws
+  sigma_cols <- grep("^sigma_e", colnames(all_draws), value = TRUE)
+  sigma_draws <- all_draws[, sigma_cols[1]]
+
+  # Compute log-likelihood matrix (S x n)
+  log_lik <- matrix(NA, nrow = S, ncol = n)
+  for (s in seq_len(S)) {
+    log_lik[s, ] <- dnorm(y, mean = fitted_mean, sd = sigma_draws[s],
+                          log = TRUE)
+  }
+
+  log_lik
+}
+
+# Compute for each model
+log_lik1 <- compute_log_lik(fit1)
+log_lik2 <- compute_log_lik(fit2)
+log_lik3 <- compute_log_lik(fit3)
+```
+
+### Computing WAIC
+
+```{r waic-compute}
+waic1 <- waic(log_lik1)
+waic2 <- waic(log_lik2)
+waic3 <- waic(log_lik3)
+
+# Compare
+loo_compare(waic1, waic2, waic3)
+```
+
+The output ranks models from best to worst, with differences in ELPD and
+standard errors:
+
+```
+#>        elpd_diff se_diff
+#> model2  0.0       0.0
+#> model3 -1.2       2.1
+#> model1 -58.7      8.3
+```
+
+### Interpreting WAIC comparison
+
+- The best model is listed first (highest ELPD)
+- `elpd_diff` shows the difference from the best model
+- `se_diff` is the standard error of the difference
+- If $|\text{elpd\_diff}| < 2 \times \text{se\_diff}$, the models are not
+  meaningfully different
+
+---
+
+## LOO-CV with the loo package
+
+LOO-CV via PSIS is generally preferred over WAIC because it is more robust and
+provides diagnostics (Pareto $k$ values) that warn when the approximation is
+unreliable.
+
+### Computing LOO
+
+```{r loo-compute}
+loo1 <- loo(log_lik1)
+loo2 <- loo(log_lik2)
+loo3 <- loo(log_lik3)
+
+# Print individual LOO results
+print(loo2)
+#> Computed from 8000 by 120 log-likelihood matrix.
+#>
+#>          Estimate   SE
+#> elpd_loo  -188.2  7.1
+#> p_loo        5.8  1.2
+#> looic      376.4 14.2
+#>
+#> All Pareto k estimates are good (k < 0.5).
+```
+
+### Comparing models with LOO
+
+```{r loo-compare}
+comp <- loo_compare(loo1, loo2, loo3)
+print(comp)
+```
+
+### Pareto $k$ diagnostics
+
+The PSIS approximation computes a Pareto shape parameter $k$ for each
+observation. This diagnostic tells you how reliable the LOO estimate is:
+
+| Pareto $k$ | Reliability | Action |
+|------------|-------------|--------|
+| $k < 0.5$ | Good | No action needed |
+| $0.5 \leq k < 0.7$ | Acceptable | Monitor, may be OK |
+| $0.7 \leq k < 1$ | Poor | Consider moment matching or refit |
+| $k \geq 1$ | Very poor | Do not trust; use K-fold CV instead |
+
+```{r pareto-k}
+# Check Pareto k values
+plot(loo2, label_points = TRUE)
+
+# Identify problematic observations
+pareto_k <- loo2$diagnostics$pareto_k
+which(pareto_k > 0.7)
+```
+
+If some Pareto $k$ values are high, those observations are highly influential.
+This may indicate outliers or model misspecification.
+
+---
+
+## Building models incrementally
+
+A systematic approach to model building is to start simple and add complexity:
+
+```{r incremental}
+# Step 1: Null model (intercept only)
+m0 <- bayesreml(yield ~ 1, data = dat,
+                n_samples = 2000, warmup = 1000, chains = 4)
+
+# Step 2: Add fixed environment effect
+m1 <- bayesreml(yield ~ env, data = dat,
+                n_samples = 2000, warmup = 1000, chains = 4)
+
+# Step 3: Add random genotype
+m2 <- bayesreml(yield ~ env, random = ~ geno, data = dat,
+                n_samples = 2000, warmup = 1000, chains = 4)
+
+# Step 4: Add random replicate within environment
+m3 <- bayesreml(yield ~ env, random = ~ geno + env:rep, data = dat,
+                n_samples = 2000, warmup = 1000, chains = 4)
+
+# Step 5: Add G x E interaction
+m4 <- bayesreml(yield ~ env, random = ~ geno + env:rep + geno:env, data = dat,
+                n_samples = 2000, warmup = 1000, chains = 4)
+
+# Compare all models
+anova(m0, m1, m2, m3, m4)
+```
+
+### Using `update()` for convenience
+
+The `update()` method lets you modify a model without retyping all arguments:
+
+```{r update-models}
+# Start with a base model
+base <- bayesreml(
+  yield ~ env,
+  random    = ~ geno,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+# Add a random effect
+extended <- update(base, random = ~ geno + env:rep)
+
+# Change the number of samples
+more_samples <- update(base, n_samples = 5000, warmup = 2000)
+```
+
+---
+
+## When WAIC and LOO disagree
+
+In practice, WAIC and LOO usually agree. When they disagree, consider:
+
+### 1. Check Pareto $k$ values
+
+High Pareto $k$ values (> 0.7) mean the PSIS approximation is unreliable. If
+LOO has problematic $k$ values but WAIC does not, trust WAIC (or better, use
+K-fold CV).
+
+```{r check-k}
+# If LOO has problematic k values
+loo_result <- loo(log_lik2)
+bad_k <- sum(loo_result$diagnostics$pareto_k > 0.7)
+cat("Observations with k > 0.7:", bad_k, "\n")
+```
+
+### 2. Check for influential observations
+
+Both WAIC and LOO are pointwise measures. If a small number of observations
+dominate the comparison, the result may be unstable.
+
+```{r influential}
+# Pointwise ELPD differences
+pw_diff <- loo2$pointwise[, "elpd_loo"] - loo1$pointwise[, "elpd_loo"]
+plot(pw_diff, pch = 16,
+     xlab = "Observation", ylab = "ELPD difference (M2 - M1)",
+     main = "Pointwise LOO comparison")
+abline(h = 0, lty = 2, col = "red")
+```
+
+### 3. Consider the effective number of parameters
+
+If $p_{\text{WAIC}}$ and $p_{\text{LOO}}$ (the effective number of parameters)
+differ substantially, the model may be misspecified or the posterior may have
+unusual geometry.
+
+```{r peff}
+cat("p_WAIC:", waic2$estimates["p_waic", "Estimate"], "\n")
+cat("p_LOO: ", loo2$estimates["p_loo",  "Estimate"], "\n")
+```
+
+### 4. Use K-fold CV as a tiebreaker
+
+When PSIS-LOO is unreliable, K-fold cross-validation provides an exact (but
+more expensive) estimate:
+
+```{r kfold}
+# K-fold CV is computationally expensive but robust
+# You would need to refit the model K times, each time
+# holding out one fold
+
+# Pseudo-code for 5-fold CV:
+K <- 5
+folds <- sample(rep(1:K, length.out = nrow(dat)))
+
+elpd_kfold <- numeric(nrow(dat))
+for (k in 1:K) {
+  train <- dat[folds != k, ]
+  test  <- dat[folds == k, ]
+
+  fit_k <- bayesreml(
+    yield ~ env,
+    random    = ~ geno,
+    data      = train,
+    n_samples = 2000,
+    warmup    = 1000,
+    chains    = 4,
+    verbose   = FALSE,
+    mcmc_verbose = FALSE
+  )
+
+  # Compute log predictive density for held-out observations
+  pred_k <- predict(fit_k, newdata = test, se.fit = TRUE)
+  # ... (compute log-likelihood for test observations)
+}
+```
+
+### Decision framework
+
+```
+                    WAIC and LOO agree?
+                    /              \
+                  Yes              No
+                  /                  \
+        Use either          Check Pareto k values
+        (prefer LOO)        /                  \
+                      All k < 0.7         Some k > 0.7
+                      /                        \
+              Models nearly          LOO unreliable:
+              equivalent;            use K-fold CV
+              choose simpler          or WAIC
+```
+
+---
+
+## Practical guidelines
+
+### How many models to compare
+
+- Compare models that answer your research question, not every possible model
+- Focus on 3--5 scientifically motivated models
+- Document your rationale for each model *before* fitting
+
+### When to use which criterion
+
+| Criterion | When to use | Advantages | Limitations |
+|-----------|-------------|------------|-------------|
+| `anova()` / DIC | Quick screening | Fast, built-in | Approximate |
+| WAIC | General use | Fully Bayesian, principled | Sensitive to outliers |
+| LOO-CV (PSIS) | General use | Diagnostics (Pareto $k$) | Can fail with influential obs |
+| K-fold CV | LOO fails | Always valid | Computationally expensive |
+
+### Reporting model comparisons
+
+When reporting model comparisons in a publication, include:
+
+1. The ELPD difference and its standard error
+2. The effective number of parameters for each model
+3. Pareto $k$ diagnostics (mention if any were problematic)
+4. A statement about convergence for all models
+
+Example:
+
+```
+Model 2 (fixed environment + random genotype) was preferred over
+Model 1 (intercept + random genotype) based on LOO-CV
+(ELPD difference = 58.7, SE = 8.3). Model 3 (adding G x E) was
+not meaningfully better than Model 2 (ELPD difference = 1.2,
+SE = 2.1). All Pareto k values were below 0.5, and all models
+converged (Rhat < 1.01, ESS > 1000).
+```
+
+### Common mistakes
+
+1. **Comparing non-converged models.** Always check convergence before
+   comparing. A model that has not converged produces meaningless WAIC/LOO
+   values.
+
+2. **Ignoring standard errors.** An ELPD difference of 2 with SE of 5 is not
+   meaningful. Always consider the uncertainty in the comparison.
+
+3. **Comparing models with different data.** All models must be fit to exactly
+   the same dataset (same observations, same response variable).
+
+4. **Over-interpreting small differences.** If two models have similar WAIC/LOO,
+   prefer the simpler one (parsimony).
+
+5. **Using DIC for complex models.** DIC can behave poorly for models with
+   many random effects or non-normal posteriors. Use WAIC or LOO instead.
+
+---
+
+## Complete comparison workflow
+
+```{r complete-workflow}
+library(bayesreml)
+library(loo)
+
+data(met_example)
+dat <- met_example$dat
+
+# 1. Define candidate models
+fit1 <- bayesreml(yield ~ 1,   random = ~ geno, data = dat,
+                  n_samples = 2000, warmup = 1000, chains = 4)
+fit2 <- bayesreml(yield ~ env, random = ~ geno, data = dat,
+                  n_samples = 2000, warmup = 1000, chains = 4)
+fit3 <- bayesreml(yield ~ env, random = ~ geno + geno:env, data = dat,
+                  n_samples = 2000, warmup = 1000, chains = 4)
+
+# 2. Quick comparison
+anova(fit1, fit2, fit3)
+
+# 3. Rigorous comparison with LOO
+log_lik1 <- compute_log_lik(fit1)  # see function defined above
+log_lik2 <- compute_log_lik(fit2)
+log_lik3 <- compute_log_lik(fit3)
+
+loo1 <- loo(log_lik1)
+loo2 <- loo(log_lik2)
+loo3 <- loo(log_lik3)
+
+# 4. Check Pareto k diagnostics
+plot(loo2)
+
+# 5. Compare
+comp <- loo_compare(loo1, loo2, loo3)
+print(comp)
+
+# 6. Inspect the best model
+summary(fit2)
+plot(fit2, type = "diagnostics")
+plot(fit2, type = "effects")
+plot(fit2, type = "variance")
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,544 @@
+---
+title: "Tutorial 4: Multi-Environment Trials and GxE"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 4: Multi-Environment Trials and GxE}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+Multi-environment trials (METs) are central to plant breeding and
+variety evaluation. Genotype-by-environment interaction (GxE) means that
+genotype rankings change across environments, complicating selection
+decisions. This tutorial demonstrates how to:
+
+- Fit diagonal, unstructured, factor-analytic, and compound-symmetry
+  GxE models
+- Produce GxE interaction plots
+- Estimate and visualise environment correlation matrices
+- Construct FA biplots with "which-won-where" analysis
+- Rank genotypes by stability and mean performance
+- Use `emmeans` for within- and across-environment means
+- Use `marginaleffects` for genotype contrasts
+- Compare with `sommer::mmer()`
+
+The dataset is `agridat::yan.winterwheat` (9 genotypes x 7
+environments).
+
+
+## Mathematical background
+
+### The MET model
+
+$$
+y_{ijk} = \mu + e_j + g_i + (ge)_{ij} + \varepsilon_{ijk}
+$$
+
+The key question is how to model the GxE term $(ge)_{ij}$. Different
+covariance structures for the $\mathbf{G}$ matrix of genotype effects
+across environments correspond to different assumptions about GxE:
+
+- **Diagonal (at):** Independent genotype effects per environment
+  (environment-specific BLUPs, no borrowing of information)
+- **US:** Full covariance, allows all pairwise environment correlations
+- **FA(k):** Parsimonious approximation capturing $k$ latent factors
+- **CS:** Assumes identical genotype variance and correlation in every
+  environment pair
+
+### GGE decomposition
+
+The GGE (Genotype plus Genotype-by-Environment) model decomposes:
+
+$$
+y_{ij} - \bar{y}_{\cdot j} = \sum_{k=1}^K \lambda_k \alpha_{ik} \gamma_{jk} + \delta_{ij}
+$$
+
+where $\lambda_k$ are singular values, $\alpha_{ik}$ are genotype
+scores, and $\gamma_{jk}$ are environment scores. This is the basis
+of the GGE biplot.
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(emmeans)
+library(marginaleffects)
+library(agridat)
+library(sommer)
+```
+
+```{r data}
+data(yan.winterwheat, package = "agridat")
+str(yan.winterwheat)
+
+ww <- yan.winterwheat
+ww$gen <- factor(ww$gen)
+ww$env <- factor(ww$env)
+
+cat("Genotypes:", nlevels(ww$gen), "\n")
+cat("Environments:", nlevels(ww$env), "\n")
+cat("Observations:", nrow(ww), "\n")
+```
+
+
+## Exploratory analysis
+
+### GxE interaction plot
+
+```{r gxe-interaction-plot, fig.width=8, fig.height=5}
+# Compute genotype means per environment
+gxe_means <- ww %>%
+  group_by(gen, env) %>%
+  summarise(mean_yield = mean(yield, na.rm = TRUE), .groups = "drop")
+
+ggplot(gxe_means, aes(x = env, y = mean_yield,
+                       group = gen, colour = gen)) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 1.5) +
+  labs(
+    x      = "Environment",
+    y      = "Yield",
+    colour = "Genotype",
+    title  = "GxE interaction plot: genotype means across environments"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title  = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+**Interpretation:** Crossing lines indicate rank changes (crossover
+interaction). Parallel lines would indicate no GxE --- the genotype
+differences are consistent across environments.
+
+
+## Model 4a: Diagonal GxE --- at(env):geno
+
+Each environment gets its own genotype variance, but no correlation
+between environments. This is equivalent to fitting separate models
+per environment but sharing the residual variance.
+
+```{r m4a-fit}
+m_4a <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ at(env):gen,
+  data      = ww,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_4a)
+```
+
+### Environment-specific BLUPs
+
+```{r m4a-blups}
+blups_4a <- m_4a$extras$blups
+str(blups_4a)
+```
+
+
+## Model 4b: Unstructured GxE --- us(env):id(geno)
+
+Freely estimate all pairwise environment correlations:
+
+```{r m4b-fit}
+m_4b <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ us(env):id(gen),
+  data      = ww,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_4b)
+```
+
+### Environment correlation matrix
+
+```{r m4b-correlation, fig.width=6, fig.height=5}
+# Compute empirical genetic correlations from BLUPs or raw data
+env_wide <- gxe_means %>%
+  pivot_wider(names_from = env, values_from = mean_yield)
+
+cor_mat <- cor(env_wide[, -1], use = "pairwise.complete.obs")
+
+# Heatmap
+cor_long <- as.data.frame(as.table(cor_mat))
+names(cor_long) <- c("Env1", "Env2", "Correlation")
+
+ggplot(cor_long, aes(x = Env1, y = Env2, fill = Correlation)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  labs(title = "Genetic correlation matrix across environments") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    axis.title   = element_blank(),
+    plot.title   = element_text(face = "bold", hjust = 0.5)
+  ) +
+  coord_fixed()
+```
+
+**Interpretation:** Clusters of highly correlated environments can be
+treated as "mega-environments" for selection purposes. Negative
+correlations indicate environments where genotype rankings are reversed.
+
+
+## Model 4c: Factor-analytic GxE --- fa(env, k):id(geno)
+
+The FA model provides a parsimonious approximation and enables biplot
+analysis:
+
+```{r m4c-fit}
+m_4c <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ fa(env, k = 2):id(gen),
+  data      = ww,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_4c)
+```
+
+### FA biplot
+
+```{r m4c-biplot, fig.width=7, fig.height=6}
+# Extract loadings
+all_draws <- do.call(rbind, lapply(m_4c$greta$draws, as.matrix))
+lambda_cols <- grep("lambda", colnames(all_draws), value = TRUE)
+lambda_means <- colMeans(all_draws[, lambda_cols, drop = FALSE])
+
+env_levels <- levels(ww$env)
+n_env <- length(env_levels)
+lambda_mat <- matrix(lambda_means, nrow = n_env, ncol = 2, byrow = FALSE)
+rownames(lambda_mat) <- env_levels
+
+# Extract genotype scores
+score_cols <- grep("score|u_gen", colnames(all_draws), value = TRUE)
+if (length(score_cols) > 0) {
+  score_means <- colMeans(all_draws[, score_cols, drop = FALSE])
+  gen_levels <- levels(ww$gen)
+  n_gen <- length(gen_levels)
+  score_mat <- matrix(score_means, nrow = n_gen, ncol = 2, byrow = FALSE)
+  rownames(score_mat) <- gen_levels
+}
+
+# Environment biplot
+env_df <- data.frame(
+  env     = env_levels,
+  Factor1 = lambda_mat[, 1],
+  Factor2 = lambda_mat[, 2]
+)
+
+ggplot() +
+  # Environment vectors
+  geom_segment(data = env_df,
+               aes(x = 0, y = 0, xend = Factor1, yend = Factor2),
+               arrow = arrow(length = unit(0.2, "cm")),
+               colour = "#E69F00", linewidth = 0.8) +
+  geom_text(data = env_df,
+            aes(x = Factor1 * 1.1, y = Factor2 * 1.1, label = env),
+            colour = "#E69F00", size = 3.5, fontface = "bold") +
+  # Reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  labs(
+    x     = "Factor 1 (overall performance)",
+    y     = "Factor 2 (GxE pattern)",
+    title = "FA(2) biplot: environment loadings"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5)) +
+  coord_fixed()
+```
+
+
+### Which-won-where analysis
+
+```{r m4c-which-won-where, fig.width=7, fig.height=6}
+# GGE biplot approach: SVD of genotype-by-environment means matrix
+ge_mat <- gxe_means %>%
+  pivot_wider(names_from = env, values_from = mean_yield) %>%
+  tibble::column_to_rownames("gen") %>%
+  as.matrix()
+
+# Centre by environment means (GGE)
+env_means <- colMeans(ge_mat, na.rm = TRUE)
+gge_mat <- sweep(ge_mat, 2, env_means)
+
+# SVD
+gge_svd <- svd(gge_mat)
+gen_scores <- gge_svd$u[, 1:2] %*% diag(sqrt(gge_svd$d[1:2]))
+env_scores <- gge_svd$v[, 1:2] %*% diag(sqrt(gge_svd$d[1:2]))
+
+gen_df <- data.frame(
+  gen = rownames(ge_mat),
+  PC1 = gen_scores[, 1],
+  PC2 = gen_scores[, 2]
+)
+
+env_df2 <- data.frame(
+  env = colnames(ge_mat),
+  PC1 = env_scores[, 1],
+  PC2 = env_scores[, 2]
+)
+
+ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+  # Genotypes
+  geom_point(data = gen_df, aes(x = PC1, y = PC2),
+             size = 3, colour = "#0072B2") +
+  geom_text(data = gen_df, aes(x = PC1, y = PC2, label = gen),
+            vjust = -0.8, size = 3, colour = "#0072B2") +
+  # Environments
+  geom_segment(data = env_df2,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.15, "cm")),
+               colour = "#D55E00", linewidth = 0.6) +
+  geom_text(data = env_df2,
+            aes(x = PC1 * 1.1, y = PC2 * 1.1, label = env),
+            colour = "#D55E00", size = 3.5) +
+  labs(
+    x     = paste0("PC1 (", round(100 * gge_svd$d[1]^2 / sum(gge_svd$d^2), 1), "%)"),
+    y     = paste0("PC2 (", round(100 * gge_svd$d[2]^2 / sum(gge_svd$d^2), 1), "%)"),
+    title = "GGE biplot: which-won-where"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5)) +
+  coord_fixed()
+```
+
+**Interpretation:** Genotypes at the vertices of the convex hull are
+the winners in the environments that fall in their sector. Environments
+near the same genotype indicate that genotype performs best there.
+
+
+## Model 4d: Compound symmetry GxE
+
+```{r m4d-fit}
+m_4d <- bayesreml(
+  fixed     = yield ~ env,
+  random    = ~ gen,
+  data      = ww,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+summary(m_4d)
+```
+
+
+## Model comparison
+
+```{r model-compare}
+anova(m_4a, m_4b, m_4c, m_4d)
+```
+
+**Interpretation:** For MET data with 7 environments, the US model has
+$7 \times 8/2 = 28$ parameters in $\mathbf{G}$ alone, while FA(2) has
+$2 \times 7 + 7 = 21$ and CS has just 2. The FA(2) model typically
+provides the best trade-off between fit and complexity.
+
+
+## Genotype stability ranking
+
+```{r stability, fig.width=7, fig.height=5}
+# Compute genotype mean and stability (SD across environments)
+stability <- gxe_means %>%
+  group_by(gen) %>%
+  summarise(
+    mean_yield = mean(mean_yield),
+    sd_yield   = sd(mean_yield),
+    cv_yield   = sd(mean_yield) / mean(mean_yield) * 100,
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(mean_yield))
+
+print(stability)
+
+ggplot(stability, aes(x = mean_yield, y = sd_yield, label = gen)) +
+  geom_point(size = 3, colour = "#CC79A7") +
+  geom_text(vjust = -0.8, size = 3) +
+  geom_vline(xintercept = mean(stability$mean_yield),
+             linetype = "dashed", colour = "grey60") +
+  geom_hline(yintercept = mean(stability$sd_yield),
+             linetype = "dashed", colour = "grey60") +
+  annotate("text", x = max(stability$mean_yield),
+           y = min(stability$sd_yield),
+           label = "Ideal:\nhigh mean,\nlow SD",
+           hjust = 1, vjust = 0, size = 3, colour = "grey40") +
+  labs(
+    x     = "Mean yield across environments",
+    y     = "SD of yield across environments",
+    title = "Genotype mean-stability plot"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+**Interpretation:** The ideal genotype appears in the bottom-right
+quadrant (high mean, low variability across environments). Genotypes
+in the top-right have high mean but are inconsistent (specific
+adaptation). Bottom-left genotypes are consistently poor.
+
+
+## Emmeans: within- and across-environment means
+
+### Across-environment genotype means
+
+```{r emmeans-across}
+emm_gen <- emmeans(m_4c, ~ gen)
+emm_gen
+
+# Pairwise comparisons
+pairs(emm_gen)
+```
+
+### Within-environment genotype means
+
+```{r emmeans-within}
+emm_gen_env <- emmeans(m_4c, ~ gen | env)
+emm_gen_env
+```
+
+### Genotype ranking per environment
+
+```{r emmeans-ranking, fig.width=8, fig.height=6}
+emm_df <- as.data.frame(emm_gen_env)
+
+ggplot(emm_df, aes(x = reorder(gen, emmean), y = emmean)) +
+  geom_point(size = 1.5, colour = "#0072B2") +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                width = 0.2, colour = "#0072B2") +
+  facet_wrap(~ env, scales = "free_y", ncol = 4) +
+  coord_flip() +
+  labs(
+    x     = "Genotype",
+    y     = "Estimated marginal mean yield",
+    title = "Genotype rankings by environment"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+
+## Marginaleffects: genotype contrasts
+
+```{r marginaleffects}
+# Average predictions per genotype
+avg_pred <- predictions(m_4c, by = "gen")
+avg_pred
+
+# Pairwise contrasts
+gen_contrasts <- comparisons(
+  m_4c,
+  variables = "gen",
+  by = "env"
+)
+head(gen_contrasts, 20)
+```
+
+
+## Comparison with sommer::mmer()
+
+```{r sommer-compare}
+# Diagonal model
+sommer_diag <- mmer(
+  fixed  = yield ~ env,
+  random = ~ vs(ds(env), gen),
+  data   = ww
+)
+summary(sommer_diag)
+
+# Compare variance components
+cat("bayesreml at(env):gen variances:\n")
+print(m_4a$extras$variance_comps)
+
+cat("\nsommer diagonal variances:\n")
+print(summary(sommer_diag)$varcomp)
+```
+
+
+## Diagnostics
+
+```{r diagnostics}
+# Trace plots for the FA model
+plot(m_4c, type = "diagnostics")
+
+# Variance components
+plot(m_4c, type = "variance")
+
+# Residuals
+plot(m_4c, type = "residuals")
+
+# Posterior predictive check
+plot(m_4c, type = "pp_check")
+```
+
+
+## Generated code inspection
+
+```{r code-inspect}
+cat(m_4c$extras$code)
+```
+
+
+## Tips for MET analysis
+
+1. **Environment coding:** Ensure environments are coded as factors with
+   meaningful labels. The factor levels determine the order in biplots
+   and correlation matrices.
+
+2. **Unbalanced data:** `bayesreml` handles unbalanced METs (missing
+   genotype-environment combinations) naturally through the Bayesian
+   framework. BLUPs for missing cells are predicted from the model.
+
+3. **Number of environments:** With $p > 10$ environments, US becomes
+   impractical. Use FA(1) or FA(2) instead.
+
+4. **Mega-environments:** Cluster environments based on the correlation
+   matrix or FA loadings. Environments in the same mega-environment have
+   similar genotype rankings.
+
+5. **Selection:** For broad adaptation, select genotypes with high
+   Factor 1 scores (overall performance). For specific adaptation,
+   consider Factor 2 scores to match genotypes to environments.
+
+
+## Summary
+
+| Model  | Structure   | Formula                    | Interpretation          |
+|--------|-------------|----------------------------|-------------------------|
+| `m_4a` | Diagonal    | `~ at(env):gen`            | Independent per env     |
+| `m_4b` | Unstructured| `~ us(env):id(gen)`        | Full correlation        |
+| `m_4c` | FA(2)       | `~ fa(env, k=2):id(gen)`  | Low-rank approximation  |
+| `m_4d` | Compound sym| `~ gen`                    | Equal corr everywhere   |
+
+The next tutorial covers **spatial models** for field trials with
+spatial trends.

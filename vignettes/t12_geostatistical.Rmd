@@ -1,0 +1,627 @@
+---
+title: "Tutorial 12: Geostatistical Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 12: Geostatistical Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Geostatistical models account for spatial correlation between observations as a
+function of their geographic distance. This is essential in field trials where
+neighbouring plots share soil, moisture, or microclimate effects that induce
+correlation beyond what treatment and blocking structures capture.
+
+This tutorial demonstrates four spatial covariance structures using
+`agridat::durban.rowcol`, a spring barley trial with 544 plots and a pronounced
+spatial trend.
+
+**Models covered:**
+
+| Model | Covariance structure | Key feature |
+|-------|---------------------|-------------|
+| m_12a | Matern              | Flexible smoothness parameter |
+| m_12b | 2D SPDE (mesh-based) | Scalable spatial approximation |
+| m_12c | Isotropic Gaussian   | Infinitely differentiable surfaces |
+| m_12d | Anisotropic Matern   | Direction-dependent range |
+
+All spatial covariance structures require constructing a covariance (or
+precision) matrix externally and passing it to `bayesreml` via the
+`known_matrices` argument.
+
+**Packages required:**
+
+```{r packages}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(agridat)
+library(fields)     # for distance matrices and variogram tools
+library(Matrix)     # for sparse matrix operations
+library(patchwork)
+```
+
+---
+
+## 1. Data preparation
+
+### Durban spring barley trial
+
+```{r data-load}
+data(durban.rowcol, package = "agridat")
+dat <- durban.rowcol
+dat$row_f <- factor(dat$row)
+dat$col_f <- factor(dat$col)
+
+str(dat)
+dim(dat)
+table(dat$gen)[1:10]   # number of genotypes
+```
+
+### Spatial layout
+
+```{r data-heatmap, fig.height = 4}
+ggplot(dat, aes(x = col, y = row, fill = yield)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Durban spring barley: raw yield heatmap",
+       x = "Column", y = "Row", fill = "Yield") +
+  coord_equal() +
+  theme_minimal()
+```
+
+The heatmap typically reveals spatial gradients --- yields that vary smoothly
+across the field, indicating the need for spatial modelling.
+
+### Empirical variogram
+
+The empirical variogram summarises how the semivariance between pairs of
+observations changes with distance $h$:
+
+$$
+\hat{\gamma}(h) = \frac{1}{2|N(h)|} \sum_{(i,j) \in N(h)}
+  \left( y_i - y_j \right)^2
+$$
+
+where $N(h)$ is the set of observation pairs separated by distance $h$.
+
+```{r variogram-empirical, fig.height = 4}
+# Compute pairwise distances
+coords <- cbind(dat$col, dat$row)
+dists  <- as.matrix(dist(coords))
+
+# Empirical variogram (binned)
+resid_raw <- residuals(lm(yield ~ gen, data = dat))
+
+bins   <- seq(0, max(dists) / 2, length.out = 30)
+n_bins <- length(bins) - 1
+vario  <- data.frame(
+  distance     = numeric(n_bins),
+  semivariance = numeric(n_bins),
+  n_pairs      = integer(n_bins)
+)
+
+for (k in seq_len(n_bins)) {
+  idx <- which(dists > bins[k] & dists <= bins[k + 1], arr.ind = TRUE)
+  idx <- idx[idx[, 1] < idx[, 2], , drop = FALSE]  # upper triangle only
+  if (nrow(idx) > 0) {
+    vario$distance[k]     <- mean(dists[idx])
+    vario$semivariance[k] <- mean((resid_raw[idx[, 1]] - resid_raw[idx[, 2]])^2) / 2
+    vario$n_pairs[k]      <- nrow(idx)
+  }
+}
+vario <- vario[vario$n_pairs > 0, ]
+
+ggplot(vario, aes(x = distance, y = semivariance)) +
+  geom_point(aes(size = n_pairs), alpha = 0.6) +
+  geom_smooth(se = FALSE, colour = "steelblue", linewidth = 1) +
+  labs(title = "Empirical variogram (genotype-adjusted residuals)",
+       x = "Distance (plot units)", y = "Semivariance",
+       size = "Pair count") +
+  theme_minimal()
+```
+
+Key variogram features to note:
+
+- **Nugget** ($c_0$): the semivariance at distance zero (measurement error +
+  micro-scale variation)
+- **Sill** ($c_0 + c_1$): the plateau semivariance (total variance)
+- **Range** ($a$): the distance at which the semivariance reaches the sill
+  (spatial correlation extent)
+
+---
+
+## 2. Constructing spatial covariance matrices
+
+### Matern covariance function
+
+The Matern covariance function is:
+
+$$
+C(h) = \sigma^2 \frac{2^{1-\nu}}{\Gamma(\nu)}
+       \left( \sqrt{2\nu} \frac{h}{\phi} \right)^{\nu}
+       K_{\nu}\!\left( \sqrt{2\nu} \frac{h}{\phi} \right)
+$$
+
+where $\sigma^2$ is the partial sill, $\phi$ is the range parameter, $\nu$
+controls smoothness, and $K_\nu$ is the modified Bessel function of the second
+kind.
+
+Special cases:
+
+- $\nu = 0.5$: exponential covariance
+- $\nu = 1.5$: Matern 3/2
+- $\nu \to \infty$: Gaussian (squared exponential)
+
+```{r cov-matern}
+# Helper: construct Matern correlation matrix
+make_matern <- function(coords, range_param, nu = 1.5) {
+  D <- as.matrix(dist(coords))
+  n <- nrow(coords)
+
+  # Matern correlation (normalised so diagonal = 1)
+  scaled <- sqrt(2 * nu) * D / range_param
+  scaled[scaled == 0] <- 1e-10  # avoid 0^nu issues
+
+  R <- (2^(1 - nu) / gamma(nu)) * (scaled^nu) * besselK(scaled, nu)
+  diag(R) <- 1
+  R[R < 0] <- 0  # numerical safety
+
+  # Ensure positive definiteness
+  R <- as.matrix(Matrix::nearPD(R)$mat)
+  return(R)
+}
+
+# Construct for the durban data
+coords <- cbind(dat$col, dat$row)
+
+# Initial range estimate from empirical variogram (eyeball ~5 units)
+R_matern <- make_matern(coords, range_param = 5, nu = 1.5)
+dim(R_matern)
+```
+
+### Gaussian (squared exponential) covariance
+
+```{r cov-gaussian}
+make_gaussian_cov <- function(coords, range_param) {
+  D <- as.matrix(dist(coords))
+  R <- exp(-(D / range_param)^2)
+  return(R)
+}
+
+R_gauss <- make_gaussian_cov(coords, range_param = 5)
+```
+
+### Anisotropic Matern
+
+Anisotropy means the spatial correlation depends on direction. We rotate and
+scale the coordinate system before computing distances:
+
+$$
+h^* = \sqrt{
+  \left(\frac{\Delta x \cos\theta + \Delta y \sin\theta}{a_1}\right)^2 +
+  \left(\frac{-\Delta x \sin\theta + \Delta y \cos\theta}{a_2}\right)^2
+}
+$$
+
+where $\theta$ is the anisotropy angle and $a_1 / a_2$ is the anisotropy ratio.
+
+```{r cov-aniso}
+make_aniso_matern <- function(coords, range1, range2, angle_deg, nu = 1.5) {
+  theta <- angle_deg * pi / 180
+  rot <- matrix(c(cos(theta), sin(theta), -sin(theta), cos(theta)),
+                nrow = 2)
+  # Scale by range in each direction
+  scale_mat <- diag(c(1 / range1, 1 / range2))
+  transform <- scale_mat %*% rot
+
+  coords_t <- t(transform %*% t(coords))
+  D <- as.matrix(dist(coords_t))
+
+  scaled <- sqrt(2 * nu) * D
+  scaled[scaled == 0] <- 1e-10
+
+  R <- (2^(1 - nu) / gamma(nu)) * (scaled^nu) * besselK(scaled, nu)
+  diag(R) <- 1
+  R[R < 0] <- 0
+
+  R <- as.matrix(Matrix::nearPD(R)$mat)
+  return(R)
+}
+
+# Example: range of 8 along rows, 4 along columns, rotated 30 degrees
+R_aniso <- make_aniso_matern(coords, range1 = 8, range2 = 4,
+                              angle_deg = 30, nu = 1.5)
+```
+
+---
+
+## 3. Model 12a: Matern covariance
+
+### Fitting
+
+We pass the spatial correlation matrix via `known_matrices` and reference it
+in the random formula using `vm()`:
+
+```{r m12a-fit}
+# Create a spatial unit identifier (one per observation)
+dat$spat_id <- factor(seq_len(nrow(dat)))
+
+m_12a <- bayesreml(
+  fixed          = yield ~ gen,
+  random         = ~ vm(spat_id, Rmat),
+  data           = dat,
+  known_matrices = list(Rmat = R_matern),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_12a)
+```
+
+### Diagnostics
+
+```{r m12a-diag, fig.height = 6}
+plot(m_12a, type = "diagnostics")
+plot(m_12a, type = "residuals")
+```
+
+### Fitted variogram overlay
+
+Compare the empirical variogram with the model-implied theoretical variogram:
+
+```{r m12a-variogram, fig.height = 4}
+# Extract posterior mean variance components
+vc <- m_12a$extras$variance_comps
+sigma2_s <- vc$estimate[grep("spat|vm", vc$component)]
+sigma2_e <- vc$estimate[vc$component == "Residual"]
+
+# Theoretical Matern variogram
+h_seq  <- seq(0.01, max(vario$distance), length.out = 100)
+scaled <- sqrt(2 * 1.5) * h_seq / 5
+gamma_theory <- sigma2_s * (1 - (2^(1 - 1.5) / gamma(1.5)) *
+                (scaled^1.5) * besselK(scaled, 1.5)) + sigma2_e
+
+theo_vario <- data.frame(distance = h_seq, semivariance = gamma_theory)
+
+ggplot() +
+  geom_point(data = vario, aes(x = distance, y = semivariance),
+             alpha = 0.6, size = 2) +
+  geom_line(data = theo_vario, aes(x = distance, y = semivariance),
+            colour = "firebrick", linewidth = 1) +
+  labs(title = "Empirical vs fitted Matern variogram",
+       x = "Distance", y = "Semivariance") +
+  theme_minimal()
+```
+
+### Spatial prediction surface
+
+```{r m12a-surface, fig.height = 5}
+dat$resid_12a <- residuals(m_12a)
+dat$fitted_12a <- fitted(m_12a)
+
+# Spatial residual map
+p_resid <- ggplot(dat, aes(x = col, y = row, fill = resid_12a)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  labs(title = "Spatial residuals (Model 12a)",
+       fill = "Residual") +
+  coord_equal() + theme_minimal()
+
+# Fitted spatial surface (kriging-like)
+p_fitted <- ggplot(dat, aes(x = col, y = row, fill = fitted_12a)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Fitted spatial surface",
+       fill = "Fitted yield") +
+  coord_equal() + theme_minimal()
+
+p_resid + p_fitted
+```
+
+### Range and sill interpretation
+
+```{r m12a-interpret}
+cat("Variance components:\n")
+print(m_12a$extras$variance_comps)
+
+# Range interpretation:
+# The practical range (where correlation drops to ~0.05) for Matern with nu=1.5
+# is approximately 4.74 * phi
+cat("\nPractical range (Matern nu=1.5): ~", round(4.74 * 5, 1),
+    "plot units\n")
+cat("This means plots beyond this distance are essentially uncorrelated.\n")
+
+# Sill = spatial variance + nugget (residual)
+cat("\nNugget (residual variance):", round(sigma2_e, 3), "\n")
+cat("Partial sill (spatial variance):", round(sigma2_s, 3), "\n")
+cat("Total sill:", round(sigma2_s + sigma2_e, 3), "\n")
+cat("Proportion spatial:", round(sigma2_s / (sigma2_s + sigma2_e), 3), "\n")
+```
+
+---
+
+## 4. Model 12b: 2D SPDE approximation
+
+The Stochastic Partial Differential Equation (SPDE) approach approximates
+continuous spatial Gaussian fields using a sparse precision matrix on a
+triangulated mesh. This is computationally efficient for large datasets.
+
+### Mesh construction
+
+```{r m12b-mesh}
+# For a regular grid, we can construct a simple precision matrix
+# that approximates the SPDE solution.
+# In practice, packages like INLA or sdmTMB provide mesh tools.
+
+# Simple SPDE-inspired precision: penalised 2D differences
+make_spde_precision <- function(coords, kappa = 1) {
+  n <- nrow(coords)
+  D <- as.matrix(dist(coords))
+
+  # Neighbourhood: connect points within distance threshold
+  threshold <- 1.5  # immediate neighbours on a grid
+  Q <- matrix(0, n, n)
+
+  for (i in seq_len(n)) {
+    neighbours <- which(D[i, ] > 0 & D[i, ] <= threshold)
+    n_neigh <- length(neighbours)
+    if (n_neigh > 0) {
+      Q[i, neighbours] <- -kappa
+      Q[i, i] <- n_neigh * kappa + kappa^2
+    } else {
+      Q[i, i] <- kappa^2
+    }
+  }
+
+  # Convert precision to correlation via inversion
+  Q_reg <- Q + diag(1e-4, n)  # regularise
+  Sigma <- solve(Q_reg)
+
+  # Standardise to correlation
+  D_inv <- diag(1 / sqrt(diag(Sigma)))
+  R <- D_inv %*% Sigma %*% D_inv
+
+  R <- as.matrix(Matrix::nearPD(R)$mat)
+  return(R)
+}
+
+R_spde <- make_spde_precision(coords, kappa = 0.5)
+```
+
+### Fitting
+
+```{r m12b-fit}
+m_12b <- bayesreml(
+  fixed          = yield ~ gen,
+  random         = ~ vm(spat_id, Rspde),
+  data           = dat,
+  known_matrices = list(Rspde = R_spde),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_12b)
+```
+
+### Spatial surface comparison
+
+```{r m12b-surface, fig.height = 4}
+dat$fitted_12b <- fitted(m_12b)
+
+ggplot(dat, aes(x = col, y = row, fill = fitted_12b)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Model 12b: SPDE-approximated spatial surface",
+       fill = "Fitted yield") +
+  coord_equal() + theme_minimal()
+```
+
+---
+
+## 5. Model 12c: Isotropic Gaussian covariance
+
+The Gaussian (squared exponential) covariance function produces infinitely
+smooth spatial surfaces:
+
+$$
+C(h) = \sigma^2 \exp\!\left(-\frac{h^2}{\phi^2}\right)
+$$
+
+This is appropriate when the underlying spatial process is believed to be very
+smooth (e.g., broad soil fertility gradients).
+
+```{r m12c-fit}
+m_12c <- bayesreml(
+  fixed          = yield ~ gen,
+  random         = ~ vm(spat_id, Rgauss),
+  data           = dat,
+  known_matrices = list(Rgauss = R_gauss),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_12c)
+```
+
+```{r m12c-surface, fig.height = 4}
+dat$fitted_12c <- fitted(m_12c)
+
+ggplot(dat, aes(x = col, y = row, fill = fitted_12c)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Model 12c: Isotropic Gaussian spatial surface",
+       fill = "Fitted yield") +
+  coord_equal() + theme_minimal()
+```
+
+---
+
+## 6. Model 12d: Anisotropic Matern
+
+```{r m12d-fit}
+m_12d <- bayesreml(
+  fixed          = yield ~ gen,
+  random         = ~ vm(spat_id, Raniso),
+  data           = dat,
+  known_matrices = list(Raniso = R_aniso),
+  n_samples      = 2000,
+  warmup         = 1000,
+  chains         = 4
+)
+summary(m_12d)
+```
+
+### Directional variograms
+
+Anisotropy can be visualised by computing variograms in different directions:
+
+```{r m12d-directional, fig.height = 5}
+# Compute directional variograms at 0, 45, 90, 135 degrees
+compute_directional_variogram <- function(coords, values, angle_deg,
+                                           tol_deg = 22.5, n_bins = 20) {
+  theta <- angle_deg * pi / 180
+  tol   <- tol_deg * pi / 180
+  n     <- length(values)
+
+  dx <- outer(coords[, 1], coords[, 1], "-")
+  dy <- outer(coords[, 2], coords[, 2], "-")
+  dd <- sqrt(dx^2 + dy^2)
+  angles <- atan2(dy, dx)
+
+  # Select pairs in the target direction
+  angle_diff <- abs(angles - theta)
+  angle_diff <- pmin(angle_diff, pi - angle_diff)
+  in_dir <- angle_diff <= tol & dd > 0
+
+  dv <- outer(values, values, "-")^2 / 2
+
+  bins <- seq(0, max(dd[in_dir]) * 0.6, length.out = n_bins + 1)
+
+  vario_dir <- data.frame(distance = numeric(n_bins),
+                           semivariance = numeric(n_bins),
+                           direction = angle_deg)
+  for (k in seq_len(n_bins)) {
+    sel <- in_dir & dd > bins[k] & dd <= bins[k + 1]
+    if (sum(sel) > 10) {
+      vario_dir$distance[k]     <- mean(dd[sel])
+      vario_dir$semivariance[k] <- mean(dv[sel])
+    }
+  }
+  vario_dir[vario_dir$distance > 0, ]
+}
+
+dir_varios <- do.call(rbind, lapply(c(0, 45, 90, 135), function(a) {
+  compute_directional_variogram(coords, resid_raw, a)
+}))
+dir_varios$direction <- factor(dir_varios$direction,
+                                labels = c("0 (E-W)", "45 (NE-SW)",
+                                           "90 (N-S)", "135 (NW-SE)"))
+
+ggplot(dir_varios, aes(x = distance, y = semivariance, colour = direction)) +
+  geom_point(size = 2) +
+  geom_smooth(se = FALSE, linewidth = 0.8) +
+  labs(title = "Directional variograms",
+       subtitle = "Different ranges by direction indicate anisotropy",
+       x = "Distance", y = "Semivariance", colour = "Direction") +
+  theme_minimal()
+```
+
+If the variograms reach their sill at different distances in different
+directions, this confirms anisotropy. The direction with the longest range is
+the direction of greatest spatial continuity.
+
+---
+
+## 7. Model comparison
+
+```{r compare-all, fig.height = 4}
+anova(m_12a, m_12b, m_12c, m_12d)
+```
+
+### Residual spatial maps side by side
+
+```{r compare-residmaps, fig.height = 8}
+dat$resid_12b <- residuals(m_12b)
+dat$resid_12c <- residuals(m_12c)
+dat$resid_12d <- residuals(m_12d)
+
+resid_long <- dat %>%
+  select(col, row, resid_12a, resid_12b, resid_12c, resid_12d) %>%
+  pivot_longer(starts_with("resid_"), names_to = "model",
+               values_to = "residual") %>%
+  mutate(model = recode(model,
+    resid_12a = "12a: Matern",
+    resid_12b = "12b: SPDE",
+    resid_12c = "12c: Gaussian",
+    resid_12d = "12d: Anisotropic"
+  ))
+
+ggplot(resid_long, aes(x = col, y = row, fill = residual)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  facet_wrap(~ model, ncol = 2) +
+  coord_equal() +
+  labs(title = "Residual spatial patterns across models",
+       fill = "Residual") +
+  theme_minimal()
+```
+
+A good spatial model should leave residuals with no visible spatial pattern.
+Remaining patchiness in the residual maps suggests the covariance structure is
+not fully capturing the spatial dependence.
+
+---
+
+## 8. Key takeaways
+
+1. **Spatial modelling requires external covariance matrices.** Unlike simple
+   random effects, spatial models need a user-constructed correlation matrix
+   passed via `known_matrices`. This gives full flexibility but requires
+   understanding of covariance functions.
+
+2. **The Matern family is the default choice** for most spatial applications
+   because it includes the smoothness parameter $\nu$ that controls the
+   differentiability of the random field.
+
+3. **Anisotropy matters in field trials.** Agricultural fields often have
+   directional gradients (e.g., along irrigation channels or slope). Directional
+   variograms are the diagnostic tool.
+
+4. **The SPDE approach** trades a dense covariance matrix for a sparse precision
+   matrix, enabling computation on larger datasets. The conceptual link to
+   Matern fields is established through the SPDE representation of the Matern
+   process.
+
+5. **Range and sill are interpretable.** The practical range tells the
+   experimenter how far spatial correlation extends, while the ratio of spatial
+   to total variance (partial sill / total sill) quantifies the strength of
+   spatial dependence.
+
+### Inspect the generated code
+
+```{r show-code}
+cat(m_12a$extras$code)
+```
+
+---
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

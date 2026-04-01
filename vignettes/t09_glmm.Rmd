@@ -1,0 +1,649 @@
+---
+title: "Tutorial 9: Generalised Linear Mixed Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 9: Generalised Linear Mixed Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Generalised linear mixed models (GLMMs) extend the linear mixed model to
+non-Gaussian responses: binary outcomes, counts, proportions, strictly
+positive continuous data, and bounded responses. The GLMM links the
+conditional mean to the linear predictor via a link function $g(\cdot)$:
+
+$$
+g\bigl(E[y_i \mid \mathbf{u}]\bigr) = \mathbf{x}_i^\top \boldsymbol{\beta}
+  + \mathbf{z}_i^\top \mathbf{u}
+$$
+
+`bayesreml` supports GLMMs through the `family` argument, using the same
+ASReml-like syntax for fixed and random effects.
+
+This tutorial covers six families across four detailed examples and
+two brief demonstrations:
+
+| Model | Family | Link | Dataset |
+|-------|--------|------|---------|
+| m_9a  | Binomial | logit | `lme4::cbpp` |
+| m_9b  | Binomial | probit | `lme4::cbpp` |
+| m_9c  | Poisson | log | `MASS::Insurance` |
+| m_9d  | Negative binomial | log | `MASS::quine` |
+| m_9e  | Gamma | log | (brief) |
+| m_9f  | Beta | logit | (brief) |
+
+**Prerequisites:**
+
+```{r prereqs}
+library(bayesreml)
+library(lme4)
+library(MASS)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(emmeans)
+library(marginaleffects)
+library(patchwork)
+```
+
+
+## 1. Mathematical Background
+
+### 1.1 GLMM Structure
+
+For observation $i$ with response $y_i$, the GLMM specifies:
+
+1. **Distribution:** $y_i \mid \mu_i \sim F(\mu_i, \phi)$ where $F$ belongs
+   to the exponential family and $\phi$ is a dispersion parameter.
+2. **Link:** $\eta_i = g(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta} + \mathbf{z}_i^\top \mathbf{u}$
+3. **Random effects:** $\mathbf{u} \sim N(\mathbf{0}, \mathbf{G})$
+
+Common link functions:
+
+| Family | Canonical link | $g(\mu)$ | $g^{-1}(\eta)$ |
+|--------|---------------|----------|----------------|
+| Binomial | logit | $\log\frac{\mu}{1-\mu}$ | $\frac{e^\eta}{1+e^\eta}$ |
+| Binomial | probit | $\Phi^{-1}(\mu)$ | $\Phi(\eta)$ |
+| Poisson | log | $\log(\mu)$ | $e^\eta$ |
+| Gamma | log | $\log(\mu)$ | $e^\eta$ |
+| Beta | logit | $\log\frac{\mu}{1-\mu}$ | $\frac{e^\eta}{1+e^\eta}$ |
+
+### 1.2 Bayesian GLMM
+
+The Bayesian formulation adds priors:
+
+$$
+\boldsymbol{\beta} \sim N(\mathbf{0}, \sigma_\beta^2 \mathbf{I}), \qquad
+\sigma_u \sim \text{half-}t(\nu, 0, s)
+$$
+
+Posterior inference is via MCMC (HMC in greta/TensorFlow). The key advantage
+over maximum likelihood (e.g., `glmer()`) is that uncertainty in variance
+components is fully propagated to predictions and contrasts.
+
+
+## 2. Binomial GLMM: Bovine Contagious Pleuropneumonia
+
+### 2.1 Data: lme4::cbpp
+
+The `cbpp` dataset records the incidence of bovine contagious
+pleuropneumonia in Ethiopian herds over four time periods.
+
+```{r data-cbpp}
+data(cbpp, package = "lme4")
+
+str(cbpp)
+head(cbpp)
+
+# Compute incidence rate
+cbpp <- cbpp %>%
+  mutate(
+    incidence_rate = incidence / size,
+    period         = factor(period)
+  )
+```
+
+### 2.2 Model 9a: Binomial / Logit
+
+```{r m9a-fit}
+m_9a <- bayesreml(
+  fixed     = cbind(incidence, size - incidence) ~ period,
+  random    = ~ herd,
+  data      = cbpp,
+  family    = "binomial",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_9a)
+```
+
+### 2.3 Odds Ratios with Credible Intervals
+
+On the logit scale, fixed effects are log-odds ratios. Exponentiating gives
+odds ratios.
+
+```{r m9a-or}
+# Extract fixed effect posterior samples
+draws_mat <- as.matrix(m_9a$greta$draws)
+beta_cols <- grep("^beta", colnames(draws_mat), value = TRUE)
+
+# Compute odds ratios
+or_df <- data.frame(
+  parameter = beta_cols,
+  OR        = exp(apply(draws_mat[, beta_cols], 2, median)),
+  OR_lo     = exp(apply(draws_mat[, beta_cols], 2, quantile, 0.025)),
+  OR_hi     = exp(apply(draws_mat[, beta_cols], 2, quantile, 0.975))
+)
+
+print(or_df)
+
+ggplot(or_df[-1, ], aes(x = parameter, y = OR)) +
+  geom_pointrange(aes(ymin = OR_lo, ymax = OR_hi), colour = "steelblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "red") +
+  coord_flip() +
+  labs(
+    title = "Odds ratios for period effects with 95% CrI",
+    x     = NULL,
+    y     = "Odds ratio"
+  ) +
+  theme_minimal()
+```
+
+### 2.4 Predicted Probabilities on Response Scale
+
+```{r m9a-probs}
+# emmeans on the response scale
+em_9a <- emmeans(m_9a, ~ period, type = "response")
+print(em_9a)
+
+em_df <- as.data.frame(em_9a)
+
+ggplot(em_df, aes(x = period, y = prob)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  colour = "steelblue", size = 1) +
+  labs(
+    title = "Predicted incidence probability by period",
+    x     = "Period",
+    y     = "P(infection)"
+  ) +
+  theme_minimal()
+```
+
+### 2.5 marginaleffects on Response Scale
+
+```{r m9a-mfx}
+# Average marginal effects on probability scale
+mfx <- avg_slopes(m_9a, type = "response")
+print(mfx)
+
+plot(mfx) +
+  labs(title = "Average marginal effects on P(infection)") +
+  theme_minimal()
+```
+
+
+## 3. Model 9b: Binomial / Probit
+
+The probit link uses the standard normal CDF instead of the logistic:
+
+$$
+P(y = 1) = \Phi(\eta)
+$$
+
+Probit coefficients are interpretable as changes in the z-score of the
+latent variable.
+
+```{r m9b-fit}
+m_9b <- bayesreml(
+  fixed     = cbind(incidence, size - incidence) ~ period,
+  random    = ~ herd,
+  data      = cbpp,
+  family    = "binomial",
+  link      = "probit",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_9b)
+
+# Compare logit vs probit on probability scale
+em_9b <- emmeans(m_9b, ~ period, type = "response")
+
+comp_link <- bind_rows(
+  as.data.frame(em_9a) %>% mutate(link = "logit"),
+  as.data.frame(em_9b) %>% mutate(link = "probit")
+)
+
+ggplot(comp_link, aes(x = period, y = prob, colour = link)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  position = position_dodge(width = 0.3), size = 0.8) +
+  labs(
+    title  = "Logit vs Probit: predicted probabilities",
+    x      = "Period",
+    y      = "P(infection)",
+    colour = "Link"
+  ) +
+  theme_minimal()
+```
+
+
+## 4. Poisson GLMM: Insurance Claims
+
+### 4.1 Data: MASS::Insurance
+
+```{r data-insurance}
+data(Insurance, package = "MASS")
+
+str(Insurance)
+
+Insurance <- Insurance %>%
+  mutate(
+    District = factor(District),
+    Group    = factor(Group),
+    Age      = factor(Age)
+  )
+```
+
+### 4.2 Model 9c: Poisson / Log
+
+The Poisson model for counts uses a log link:
+
+$$
+\log(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta} + u_{\text{District}[i]}
+$$
+
+The offset $\log(\text{Holders})$ accounts for exposure.
+
+```{r m9c-fit}
+m_9c <- bayesreml(
+  fixed     = Claims ~ Group + Age + offset(log(Holders)),
+  random    = ~ District,
+  data      = Insurance,
+  family    = "poisson",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_9c)
+```
+
+### 4.3 Rate Ratios
+
+Exponentiated Poisson coefficients are rate ratios (incidence rate ratios).
+
+```{r m9c-rr}
+draws_mat <- as.matrix(m_9c$greta$draws)
+beta_cols <- grep("^beta", colnames(draws_mat), value = TRUE)
+
+rr_df <- data.frame(
+  parameter = beta_cols,
+  RR        = exp(apply(draws_mat[, beta_cols], 2, median)),
+  RR_lo     = exp(apply(draws_mat[, beta_cols], 2, quantile, 0.025)),
+  RR_hi     = exp(apply(draws_mat[, beta_cols], 2, quantile, 0.975))
+)
+
+print(rr_df)
+
+ggplot(rr_df[-1, ], aes(x = parameter, y = RR)) +
+  geom_pointrange(aes(ymin = RR_lo, ymax = RR_hi), colour = "darkgreen") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "red") +
+  coord_flip() +
+  labs(
+    title = "Rate ratios with 95% CrI (Poisson model)",
+    x     = NULL,
+    y     = "Rate ratio"
+  ) +
+  theme_minimal()
+```
+
+### 4.4 Predicted Rates on Response Scale
+
+```{r m9c-pred}
+em_9c <- emmeans(m_9c, ~ Group | Age, type = "response",
+                 offset = log(mean(Insurance$Holders)))
+print(em_9c)
+
+em_df <- as.data.frame(em_9c)
+
+ggplot(em_df, aes(x = Group, y = rate, colour = Age)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  position = position_dodge(width = 0.4)) +
+  labs(
+    title  = "Predicted claim rates by vehicle group and age",
+    x      = "Vehicle group",
+    y      = "Claims per holder",
+    colour = "Age group"
+  ) +
+  theme_minimal()
+```
+
+### 4.5 Overdispersion Check
+
+```{r m9c-overdisp}
+# Pearson chi-squared / residual df
+resid_pearson <- residuals(m_9c, type = "pearson")
+overdisp_ratio <- sum(resid_pearson^2) / m_9c$glm$df.residual
+
+cat("Overdispersion ratio:", round(overdisp_ratio, 2), "\n")
+cat("(Values >> 1 suggest overdispersion; consider negative binomial)\n")
+```
+
+### 4.6 Rootogram for Count Data
+
+A rootogram (Kleiber & Zeileis 2016) compares observed and expected
+frequencies on a square-root scale, making departures visible.
+
+```{r rootogram}
+# Manual rootogram
+obs_freq <- table(Insurance$Claims)
+max_count <- max(Insurance$Claims)
+
+# Predicted mean counts
+mu_hat <- fitted(m_9c)
+
+# Expected frequencies under Poisson
+exp_freq <- sapply(0:max_count, function(k) {
+  sum(dpois(k, lambda = mu_hat))
+})
+
+root_df <- data.frame(
+  count    = 0:max_count,
+  observed = sqrt(as.numeric(obs_freq[as.character(0:max_count)])),
+  expected = sqrt(exp_freq)
+)
+root_df$observed[is.na(root_df$observed)] <- 0
+
+ggplot(root_df, aes(x = count)) +
+  geom_col(aes(y = observed), fill = "steelblue", alpha = 0.6, width = 0.8) +
+  geom_point(aes(y = expected), colour = "red", size = 2) +
+  geom_line(aes(y = expected), colour = "red", linewidth = 0.5) +
+  labs(
+    title = "Rootogram: observed (bars) vs expected (red) frequencies",
+    x     = "Count",
+    y     = expression(sqrt(frequency))
+  ) +
+  theme_minimal()
+```
+
+
+## 5. Negative Binomial GLMM: School Absences
+
+### 5.1 Data: MASS::quine
+
+```{r data-quine}
+data(quine, package = "MASS")
+
+str(quine)
+
+quine <- quine %>%
+  mutate(
+    Eth  = factor(Eth),
+    Sex  = factor(Sex),
+    Age  = factor(Age),
+    Lrn  = factor(Lrn)
+  )
+
+# Check overdispersion signal
+cat("Mean:", round(mean(quine$Days), 2), "\n")
+cat("Var: ", round(var(quine$Days), 2), "\n")
+cat("Var/Mean ratio:", round(var(quine$Days) / mean(quine$Days), 2), "\n")
+```
+
+A variance-to-mean ratio well above 1 signals overdispersion, making the
+negative binomial preferable to Poisson.
+
+### 5.2 Model 9d: Negative Binomial
+
+The negative binomial model adds a dispersion parameter $\theta$ (also
+called the size or shape parameter):
+
+$$
+y_i \sim \text{NegBin}(\mu_i, \theta), \qquad
+\text{Var}(y_i) = \mu_i + \frac{\mu_i^2}{\theta}
+$$
+
+As $\theta \to \infty$, this converges to Poisson.
+
+```{r m9d-fit}
+m_9d <- bayesreml(
+  fixed     = Days ~ Eth + Sex + Age + Lrn,
+  random    = ~ Eth:Sex,
+  data      = quine,
+  family    = "negative_binomial",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_9d)
+```
+
+### 5.3 Dispersion Parameter Posterior
+
+```{r m9d-theta}
+theta_samples <- as.matrix(m_9d$greta$draws)[, "theta"]
+
+ggplot(data.frame(theta = theta_samples), aes(x = theta)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "darkorange", alpha = 0.7) +
+  geom_density(colour = "brown", linewidth = 1) +
+  labs(
+    title    = "Posterior of dispersion parameter theta",
+    subtitle = paste0("Median = ", round(median(theta_samples), 2)),
+    x = expression(theta), y = "Density"
+  ) +
+  theme_minimal()
+```
+
+Small $\theta$ indicates substantial overdispersion relative to Poisson.
+
+### 5.4 emmeans on Link and Response Scales
+
+```{r m9d-emmeans}
+# Link scale (log counts)
+em_link <- emmeans(m_9d, ~ Eth + Sex, type = "link")
+print(em_link)
+
+# Response scale (expected counts)
+em_resp <- emmeans(m_9d, ~ Eth + Sex, type = "response")
+print(em_resp)
+
+em_df <- as.data.frame(em_resp)
+
+ggplot(em_df, aes(x = Eth, y = response, colour = Sex)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  position = position_dodge(width = 0.3), size = 1) +
+  labs(
+    title  = "Expected days absent by ethnicity and sex",
+    x      = "Ethnicity",
+    y      = "Expected days absent",
+    colour = "Sex"
+  ) +
+  theme_minimal()
+```
+
+### 5.5 Poisson vs Negative Binomial Comparison
+
+```{r poisson-vs-nb}
+m_9c_quine <- bayesreml(
+  fixed     = Days ~ Eth + Sex + Age + Lrn,
+  random    = ~ Eth:Sex,
+  data      = quine,
+  family    = "poisson",
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+data.frame(
+  Model = c("Poisson", "Negative Binomial"),
+  WAIC  = c(m_9c_quine$extras$waic$waic, m_9d$extras$waic$waic)
+)
+```
+
+
+## 6. Brief Demonstrations of Other Families
+
+### 6.1 Model 9e: Gamma
+
+The Gamma distribution models strictly positive continuous data with a
+right skew (e.g., survival times, costs, variances). With a log link:
+
+$$
+\log(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta} + \mathbf{z}_i^\top \mathbf{u}
+$$
+
+```{r m9e}
+# m_9e <- bayesreml(
+#   fixed     = time ~ treatment,
+#   random    = ~ patient,
+#   data      = dat_gamma,
+#   family    = "gamma",
+#   n_samples = 2000,
+#   warmup    = 1000,
+#   chains    = 4
+# )
+# summary(m_9e)
+```
+
+### 6.2 Model 9f: Beta
+
+The Beta distribution models proportions on $(0, 1)$ (e.g., disease
+severity index, fraction germinated). With a logit link:
+
+$$
+\text{logit}(\mu_i) = \mathbf{x}_i^\top \boldsymbol{\beta} + \mathbf{z}_i^\top \mathbf{u}
+$$
+
+```{r m9f}
+# m_9f <- bayesreml(
+#   fixed     = proportion ~ treatment,
+#   random    = ~ block,
+#   data      = dat_beta,
+#   family    = "beta",
+#   n_samples = 2000,
+#   warmup    = 1000,
+#   chains    = 4
+# )
+# summary(m_9f)
+```
+
+
+## 7. Link Function Interpretation Guide
+
+Understanding coefficients on the link scale is essential for correct
+interpretation.
+
+### 7.1 Logit Link (Binomial)
+
+- **Coefficient $\beta$:** log-odds ratio. A unit increase in $x$ multiplies
+  the odds by $e^\beta$.
+- **Conversion:** $\text{OR} = e^\beta$; probability at reference:
+  $p = \text{logit}^{-1}(\alpha)$.
+
+### 7.2 Log Link (Poisson / Negative Binomial / Gamma)
+
+- **Coefficient $\beta$:** log rate ratio. A unit increase in $x$ multiplies
+  the expected count/rate by $e^\beta$.
+- **Conversion:** $\text{RR} = e^\beta$.
+
+### 7.3 Probit Link (Binomial)
+
+- **Coefficient $\beta$:** change in $\Phi^{-1}(p)$. Less directly
+  interpretable; often rescaled to approximate odds ratios via
+  $\text{OR} \approx e^{1.6 \beta}$.
+
+### 7.4 General Advice
+
+Always report effects on the response scale using `emmeans(type = "response")`
+or `marginaleffects`. This avoids the need for readers to mentally back-transform
+coefficients.
+
+
+## 8. Convergence Considerations for GLMMs
+
+GLMMs present additional MCMC challenges compared to Gaussian models:
+
+1. **Separation.** In binomial models with rare events, posterior
+   distributions for fixed effects can be very wide. Informative priors
+   (smaller `prior_fixed_sd`) or penalised approaches help.
+
+2. **Discrete data.** HMC can struggle with discrete latent variables.
+   `bayesreml` marginalises over the random effects analytically where
+   possible.
+
+3. **Overdispersion.** Always compare Poisson and negative binomial fits.
+   The WAIC difference is informative.
+
+4. **Random effect variance near zero.** When $\sigma_u^2$ is small, the
+   posterior may concentrate near the boundary. Check trace plots for
+   "sticky" chains.
+
+```{r convergence-checks}
+# Standard checks apply to all GLMM models
+mcmc_trace(m_9d$greta$draws, regex_pars = "sigma|theta")
+mcmc_neff(m_9d$greta$draws)
+mcmc_rhat(m_9d$greta$draws)
+```
+
+
+## 9. Summary
+
+| Model | Family | Link | Key output |
+|-------|--------|------|-----------|
+| m_9a  | Binomial | logit | Odds ratios, predicted probabilities |
+| m_9b  | Binomial | probit | z-score coefficients |
+| m_9c  | Poisson | log | Rate ratios, rootogram |
+| m_9d  | Neg. binomial | log | Rate ratios + dispersion $\theta$ |
+| m_9e  | Gamma | log | Positive continuous, right-skewed |
+| m_9f  | Beta | logit | Proportions on (0,1) |
+
+**Key take-aways:**
+
+1. `bayesreml` handles GLMMs by specifying `family = "binomial"`,
+   `"poisson"`, `"negative_binomial"`, `"gamma"`, or `"beta"` with the
+   same formula interface as Gaussian models.
+2. Always exponentiate coefficients for interpretability: odds ratios
+   (logit), rate ratios (log).
+3. Use `emmeans(type = "response")` and `marginaleffects` to report effects
+   on the natural scale.
+4. For count data, always check overdispersion and compare Poisson vs
+   negative binomial via WAIC.
+5. Bayesian GLMMs handle separation and small-sample issues better than
+   ML methods, but require careful prior specification and convergence
+   monitoring.
+
+**Future work:** Several GLMM families are not yet supported by
+`bayesreml`, including ordinal (cumulative logit) models, zero-inflated
+Poisson and negative binomial models, multinomial models, and
+frailty/survival models. Support for these families may be added in
+future releases.
+
+
+## References
+
+- Bolker, B. M. et al. (2009). Generalized linear mixed models: a practical
+  guide for ecology and evolution. *Trends in Ecology & Evolution*, 24(3),
+  127--135.
+- Gelman, A. et al. (2013). *Bayesian Data Analysis* (3rd ed.). CRC Press.
+- Kleiber, C. & Zeileis, A. (2016). Visualizing count data regressions
+  using rootograms. *The American Statistician*, 70(3), 296--303.
+- McCullagh, P. & Nelder, J. A. (1989). *Generalized Linear Models*
+  (2nd ed.). Chapman & Hall.

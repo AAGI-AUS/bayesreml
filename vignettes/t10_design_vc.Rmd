@@ -1,0 +1,564 @@
+---
+title: "Tutorial 10: Design Variance Components"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 10: Design Variance Components}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+Agricultural experiments use structured designs --- randomised complete
+blocks, split-plots, strip-plots, and nested designs --- that introduce
+multiple strata of variation. Correctly modelling these strata is essential
+for valid inference. The variance component (VC) at each design level
+quantifies the contribution of that stratum to total variability.
+
+This tutorial covers four design-based models with increasing complexity:
+
+| Model | Design | Random formula |
+|-------|--------|---------------|
+| m_10a | Nested: block within rep | `~ rep + rep:block` |
+| m_10b | Three-way: rep within loc within year | `~ year + year:loc + year:loc:rep` |
+| m_10c | Partially nested (split-plot) | `~ rep + rep:whole_plot` |
+| m_10d | Block within rep (with genotype) | `~ rep + rep:block + gen` |
+
+**Dataset.** We use `agridat::gomez.splitplot.subsample` for a split-plot
+design with sub-sampling, which provides a clean pedagogical example with
+known nesting structure.
+
+**Prerequisites:**
+
+```{r prereqs}
+library(bayesreml)
+library(agridat)
+library(lme4)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(patchwork)
+```
+
+
+## 1. Data Preparation
+
+```{r data-prep}
+data(gomez.splitplot.subsample, package = "agridat")
+dat <- gomez.splitplot.subsample
+
+str(dat)
+head(dat)
+
+dat <- dat %>%
+  mutate(
+    rep    = factor(rep),
+    gen    = factor(gen),
+    nitro  = factor(nitro),
+    # Create unique whole-plot ID (gen within rep)
+    wp     = interaction(rep, gen, drop = TRUE)
+  )
+
+cat("Reps:     ", nlevels(dat$rep), "\n")
+cat("Genotypes:", nlevels(dat$gen), "\n")
+cat("Nitro:    ", nlevels(dat$nitro), "\n")
+cat("Obs:      ", nrow(dat), "\n")
+```
+
+This is a split-plot design where:
+
+- **Whole-plot factor:** genotype (`gen`), randomised within replicates
+- **Sub-plot factor:** nitrogen level (`nitro`), randomised within whole plots
+- **Sub-samples:** multiple observations per sub-plot
+
+
+## 2. Mathematical Background
+
+### 2.1 Nested Random Effects
+
+In a nested design with blocks ($b$) nested within replicates ($r$), the
+model is:
+
+$$
+y_{ijk} = \mu + \alpha_i + r_j + (rb)_{jk} + \varepsilon_{ijk}
+$$
+
+where:
+
+- $\alpha_i$ is the fixed treatment effect
+- $r_j \sim N(0, \sigma_r^2)$ is the replicate random effect
+- $(rb)_{jk} \sim N(0, \sigma_{rb}^2)$ is the block-within-rep random effect
+- $\varepsilon_{ijk} \sim N(0, \sigma^2)$ is the residual
+
+### 2.2 Split-Plot Design
+
+A split-plot introduces two error strata:
+
+$$
+y_{ijk} = \mu + \alpha_i + \beta_j + (\alpha\beta)_{ij} + r_k + (r\alpha)_{ik} + \varepsilon_{ijk}
+$$
+
+where:
+
+- $\alpha_i$ is the whole-plot factor (fixed or random)
+- $\beta_j$ is the sub-plot factor (fixed)
+- $r_k \sim N(0, \sigma_r^2)$ is the replicate effect
+- $(r\alpha)_{ik} \sim N(0, \sigma_{wp}^2)$ is the whole-plot error
+- $\varepsilon_{ijk} \sim N(0, \sigma^2)$ is the sub-plot (residual) error
+
+The whole-plot error $\sigma_{wp}^2$ provides the correct denominator for
+testing whole-plot factor effects. Ignoring this stratum inflates the
+effective sample size and produces anti-conservative tests.
+
+### 2.3 Variance Partitioning
+
+The total phenotypic variance is partitioned as:
+
+$$
+\sigma_P^2 = \sigma_r^2 + \sigma_{wp}^2 + \sigma^2
+$$
+
+The proportion of variance at each level is:
+
+$$
+\text{ICC}_r = \frac{\sigma_r^2}{\sigma_P^2}, \qquad
+\text{ICC}_{wp} = \frac{\sigma_{wp}^2}{\sigma_P^2}
+$$
+
+### 2.4 Bayesian Priors
+
+Each variance component receives a weakly informative prior:
+
+$$
+\sigma_r, \sigma_{wp}, \sigma \sim \text{half-}t(\nu, 0, s)
+$$
+
+where $s$ is controlled by `prior_vc_sd`. The Bayesian approach avoids
+boundary issues (variance estimates constrained to be non-negative) and
+provides full posterior distributions for ICC and variance ratios.
+
+
+## 3. Model 10a: Nested Block within Rep
+
+We begin with a simple nested random effects model.
+
+```{r m10a-fit}
+m_10a <- bayesreml(
+  fixed     = yield ~ nitro,
+  random    = ~ rep + rep:gen,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_10a)
+```
+
+### 3.1 Generated Code
+
+```{r m10a-code}
+cat(m_10a$extras$code)
+```
+
+### 3.2 Variance Components Table
+
+```{r m10a-vc}
+vc_10a <- m_10a$extras$variance_comps
+print(vc_10a)
+```
+
+### 3.3 Convergence
+
+```{r m10a-diag}
+mcmc_trace(m_10a$greta$draws, regex_pars = "sigma")
+mcmc_dens_overlay(m_10a$greta$draws, regex_pars = "sigma")
+```
+
+
+## 4. Model 10b: Three-Way Nested Design
+
+For larger MET experiments, the nesting structure extends to
+rep-within-location-within-year. We demonstrate this using the bundled
+`met_example` data.
+
+```{r m10b-data}
+data(met_example)
+met <- met_example$dat
+
+met <- met %>%
+  mutate(
+    year = factor(ifelse(env %in% c("E1", "E2"), "Y1", "Y2")),
+    loc  = factor(ifelse(env %in% c("E1", "E3"), "L1", "L2"))
+  )
+
+str(met)
+```
+
+```{r m10b-fit}
+m_10b <- bayesreml(
+  fixed     = yield ~ geno,
+  random    = ~ year + year:loc + year:loc:rep,
+  data      = met,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_10b)
+```
+
+### 4.1 Variance at Each Design Level
+
+```{r m10b-vc}
+vc_10b <- m_10b$extras$variance_comps
+print(vc_10b)
+
+# Variance partitioning bar chart
+vc_plot <- vc_10b %>%
+  mutate(
+    pct = estimate / sum(estimate) * 100,
+    term = factor(term, levels = rev(term))
+  )
+
+ggplot(vc_plot, aes(x = "", y = pct, fill = term)) +
+  geom_col(width = 0.6) +
+  coord_flip() +
+  labs(
+    title = "Variance partitioning across design strata",
+    x     = NULL,
+    y     = "% of total variance",
+    fill  = "Source"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal()
+```
+
+
+## 5. Model 10c: Split-Plot (Partially Nested)
+
+The split-plot model is the canonical example of partial nesting: the
+whole-plot factor is nested within reps, but the sub-plot factor crosses
+whole plots.
+
+```{r m10c-fit}
+m_10c <- bayesreml(
+  fixed     = yield ~ gen * nitro,
+  random    = ~ rep + rep:gen,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_10c)
+```
+
+### 5.1 Split-Plot VC Table
+
+```{r m10c-vc}
+vc_10c <- m_10c$extras$variance_comps
+print(vc_10c)
+
+cat("\nWhole-plot error (rep:gen):",
+    vc_10c$estimate[vc_10c$term == "rep:gen"], "\n")
+cat("Sub-plot error (residual):",
+    vc_10c$estimate[vc_10c$term == "residual"], "\n")
+```
+
+The whole-plot error ($\sigma_{wp}^2$) is the variance component for
+`rep:gen`. In a properly specified split-plot analysis, the F-test for the
+whole-plot factor (genotype) should use $\sigma_{wp}^2$ as the denominator,
+not $\sigma^2$. The Bayesian model automatically accounts for this through
+the random effects structure.
+
+### 5.2 Comparison with lme4
+
+```{r m10c-lmer}
+m_lmer <- lmer(yield ~ gen * nitro + (1 | rep) + (1 | rep:gen), data = dat)
+summary(m_lmer)
+
+# Compare VCs
+vc_lmer <- as.data.frame(VarCorr(m_lmer))
+
+vc_comp <- data.frame(
+  Source   = c("rep", "rep:gen", "residual"),
+  lmer    = vc_lmer$vcov,
+  bayesreml = vc_10c$estimate
+)
+
+print(vc_comp)
+
+# Correlation between estimates
+cat("\nCorrelation:", round(cor(vc_comp$lmer, vc_comp$bayesreml), 4), "\n")
+```
+
+
+## 6. Model 10d: Block within Rep with Genotype as Random
+
+Here we treat genotype as random (for BLUP prediction) alongside the design
+structure.
+
+```{r m10d-fit}
+m_10d <- bayesreml(
+  fixed     = yield ~ nitro,
+  random    = ~ gen + rep + rep:gen,
+  data      = dat,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_10d)
+```
+
+### 6.1 BLUPs at Each Level
+
+```{r m10d-blups}
+blups <- m_10d$extras$blups
+
+# Genotype BLUPs
+gen_blups <- blups %>%
+  filter(term == "gen") %>%
+  arrange(desc(estimate))
+
+print(gen_blups)
+
+# Rep BLUPs
+rep_blups <- blups %>%
+  filter(term == "rep")
+
+print(rep_blups)
+```
+
+### 6.2 Genotype BLUP Dot Plot
+
+```{r m10d-dotplot}
+ggplot(gen_blups, aes(x = reorder(level, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), colour = "steelblue") +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(
+    title = "Genotype BLUPs with 95% CrI",
+    x     = "Genotype",
+    y     = "BLUP"
+  ) +
+  theme_minimal()
+```
+
+
+## 7. Design Efficiency
+
+The design efficiency measures how much information the design extracts
+relative to a completely randomised design. For a split-plot, the relative
+efficiency for the whole-plot factor is:
+
+$$
+\text{RE}_{wp} = \frac{\sigma_{wp}^2 + \sigma^2}{\sigma_{wp}^2}
+\cdot \frac{n_{wp}}{n_{wp} - 1}
+$$
+
+This tells us how many more observations a CRD would need to achieve the
+same precision as the split-plot.
+
+```{r efficiency}
+# Extract variance components
+draws_mat <- as.matrix(m_10c$greta$draws)
+sigma_rep  <- draws_mat[, "sigma_rep"]
+sigma_wp   <- draws_mat[, "sigma_rep:gen"]
+sigma_e    <- draws_mat[, "sigma_resid"]
+
+# Posterior of relative efficiency
+RE_wp <- (sigma_wp^2 + sigma_e^2) / sigma_wp^2
+
+cat("Relative efficiency (whole-plot):\n")
+cat("  Median:", round(median(RE_wp), 2), "\n")
+cat("  95% CrI: [", round(quantile(RE_wp, 0.025), 2), ",",
+    round(quantile(RE_wp, 0.975), 2), "]\n")
+```
+
+
+## 8. Nested Dot Plot (VC Visualisation)
+
+A nested dot plot shows the contribution of each random effect level,
+grouped by the nesting structure.
+
+```{r nested-dotplot}
+# All random effect BLUPs
+all_blups <- m_10d$extras$blups
+
+# Faceted dot plot by term
+ggplot(all_blups, aes(x = reorder(level, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), size = 0.3,
+                  colour = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ term, scales = "free_y") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(
+    title = "Random effect BLUPs at each design level",
+    x     = NULL,
+    y     = "BLUP"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+
+## 9. ICC and Variance Proportion Posterior
+
+The intraclass correlation coefficient (ICC) at each level has a full
+posterior distribution in the Bayesian framework.
+
+```{r icc}
+# Total variance
+sigma_total2 <- sigma_rep^2 + sigma_wp^2 + sigma_e^2
+
+icc_rep <- sigma_rep^2 / sigma_total2
+icc_wp  <- sigma_wp^2  / sigma_total2
+icc_e   <- sigma_e^2   / sigma_total2
+
+icc_df <- data.frame(
+  ICC   = c(icc_rep, icc_wp, icc_e),
+  Level = rep(c("Replicate", "Whole-plot", "Residual"),
+              each = length(icc_rep))
+)
+
+ggplot(icc_df, aes(x = ICC, fill = Level)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Level, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Posterior distributions of ICC at each design level",
+    x     = "ICC (proportion of total variance)",
+    y     = "Density"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+## 10. Using agridat::mcconway.turnip
+
+An alternative dataset for demonstrating split-plot designs:
+
+```{r mcconway}
+data(mcconway.turnip, package = "agridat")
+
+turnip <- mcconway.turnip %>%
+  mutate(
+    gen     = factor(gen),
+    density = factor(density),
+    block   = factor(block)
+  )
+
+str(turnip)
+
+m_turnip <- bayesreml(
+  fixed     = yield ~ gen * density,
+  random    = ~ block + block:gen,
+  data      = turnip,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+
+summary(m_turnip)
+m_turnip$extras$variance_comps
+```
+
+
+## 11. Comparison with lme4 across All Models
+
+```{r lmer-all}
+# Model 10a
+m_lmer_a <- lmer(yield ~ nitro + (1 | rep) + (1 | rep:gen), data = dat)
+
+# Model 10d
+m_lmer_d <- lmer(yield ~ nitro + (1 | gen) + (1 | rep) + (1 | rep:gen),
+                 data = dat)
+
+# Tabulate comparisons
+lmer_vc_d <- as.data.frame(VarCorr(m_lmer_d))
+
+vc_comp_d <- data.frame(
+  Source    = c("gen", "rep", "rep:gen", "residual"),
+  lmer     = lmer_vc_d$vcov,
+  bayesreml = m_10d$extras$variance_comps$estimate
+)
+
+print(vc_comp_d)
+cat("\nCorrelation:", round(cor(vc_comp_d$lmer, vc_comp_d$bayesreml), 4), "\n")
+```
+
+
+## 12. Practical Guidance
+
+### When to Use Design-Based VCs
+
+- **Always** for designed experiments (RCBD, split-plot, strip-plot, etc.).
+  Ignoring design structure leads to incorrect standard errors.
+- **Optional** for observational data where "blocking" is natural
+  (e.g., clinic within region, classroom within school).
+
+### Choosing Fixed vs Random
+
+- **Fixed:** factors whose specific levels are of interest (treatments,
+  genotypes in variety trials).
+- **Random:** factors whose levels are a sample from a larger population
+  (reps, blocks, plots, years, locations in MET).
+
+### Number of Levels Rule of Thumb
+
+- Fewer than 5 levels: usually better as fixed (insufficient information
+  to estimate $\sigma^2$ well).
+- 5+ levels: random effects are estimable and shrinkage is beneficial.
+
+
+## 13. Summary
+
+| Model | Random formula | Design |
+|-------|---------------|--------|
+| m_10a | `~ rep + rep:gen` | Simple nested |
+| m_10b | `~ year + year:loc + year:loc:rep` | Three-way nested MET |
+| m_10c | `~ rep + rep:gen` (with `gen*nitro` fixed) | Split-plot |
+| m_10d | `~ gen + rep + rep:gen` | Split-plot with genotype BLUP |
+
+**Key take-aways:**
+
+1. Design structure must be reflected in the random formula. Nesting is
+   specified with the colon operator: `rep:block` means block nested
+   within rep.
+2. In split-plot designs, the whole-plot error (`rep:whole_plot`) is
+   distinct from the sub-plot residual. Omitting it inflates precision
+   for whole-plot factor comparisons.
+3. Variance partitioning (ICC) quantifies how much variation originates
+   at each design level, guiding future experimental design.
+4. Bayesian estimation provides full posteriors for VCs and ICCs, avoiding
+   boundary problems (negative variance estimates) that occur in REML.
+5. `bayesreml` and `lme4::lmer()` produce highly concordant VC estimates,
+   with `bayesreml` additionally providing credible intervals and BLUP
+   uncertainty.
+
+
+## References
+
+- Cochran, W. G. & Cox, G. M. (1957). *Experimental Designs* (2nd ed.).
+  Wiley.
+- Gelman, A. & Hill, J. (2007). *Data Analysis Using Regression and
+  Multilevel/Hierarchical Models*. Cambridge University Press.
+- Gomez, K. A. & Gomez, A. A. (1984). *Statistical Procedures for
+  Agricultural Research* (2nd ed.). Wiley.
+- Piepho, H. P., Buchse, A. & Emrich, K. (2003). A hitchhiker's guide to
+  mixed models for randomized experiments. *Journal of Agronomy and Crop
+  Science*, 189, 310--322.

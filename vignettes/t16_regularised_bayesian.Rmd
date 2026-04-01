@@ -1,0 +1,699 @@
+---
+title: "Tutorial 16: Regularised Bayesian Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 16: Regularised Bayesian Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+This tutorial demonstrates regularised Bayesian regression models for
+high-dimensional marker-effect estimation. These models are **greta-native**
+and go beyond what ASReml can fit, showcasing the unique capabilities of
+`bayesreml`'s Bayesian backend. You will learn how to:
+
+- Fit BayesA (scaled-$t$ / exponential slab) shrinkage
+- Fit Bayesian LASSO (double-exponential prior)
+- Fit the Horseshoe prior (global-local shrinkage)
+- Visualise and compare shrinkage profiles across priors
+- Produce Manhattan plots of marker effects
+- Evaluate predictive accuracy via cross-validation
+- Overlay prior and posterior densities
+
+We use a synthetic marker dataset derived from the bundled `met_example` data
+with 50 markers and a continuous phenotype.
+
+## Mathematical background
+
+### The general marker-effects model
+
+Given $n$ observations and $p$ markers, the linear model is
+
+$$
+\mathbf{y} = \mathbf{1}\mu + \mathbf{M}\boldsymbol{\alpha} + \boldsymbol{\varepsilon},
+\qquad \boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0},\,\sigma_e^2 \mathbf{I})
+$$
+
+where $\mathbf{M}$ is the $n \times p$ marker matrix (centred and scaled)
+and $\boldsymbol{\alpha}$ is the vector of marker effects. Regularisation is
+imposed through the prior on $\alpha_j$.
+
+### BayesA (Model 16a)
+
+Each marker effect receives a scaled-$t$ prior, equivalent to a
+scale-mixture of normals with marker-specific variances:
+
+$$
+\alpha_j \mid \sigma_j^2 \sim \mathcal{N}(0,\,\sigma_j^2), \qquad
+\sigma_j^2 \sim \text{Scaled-Inv-}\chi^2(\nu,\,S^2)
+$$
+
+The heavy tails of the $t$-distribution allow large-effect markers to
+escape shrinkage while small effects are pulled toward zero. The degrees
+of freedom $\nu$ controls the heaviness: small $\nu$ (e.g., 4) gives
+heavy tails; large $\nu$ approaches a Gaussian (ridge) prior.
+
+### Bayesian LASSO (Model 16b)
+
+The double-exponential (Laplace) prior induces $L_1$-type shrinkage:
+
+$$
+\alpha_j \mid \lambda \sim \text{Double-Exponential}(0,\,\lambda^{-1}),
+\qquad \lambda \sim \text{Gamma}(a_\lambda,\,b_\lambda)
+$$
+
+This is the Bayesian analogue of the frequentist LASSO. The prior density
+has a sharp peak at zero, producing stronger shrinkage of small effects
+than the Gaussian (ridge) prior, but lighter tails than BayesA.
+
+### Horseshoe (Model 16c)
+
+The horseshoe prior uses a global-local shrinkage hierarchy:
+
+$$
+\alpha_j \mid \lambda_j, \tau \sim \mathcal{N}(0,\,\lambda_j^2 \tau^2), \qquad
+\lambda_j \sim \text{Half-Cauchy}(0, 1), \qquad
+\tau \sim \text{Half-Cauchy}(0, \tau_0)
+$$
+
+where $\tau$ is the **global** shrinkage parameter (pulling all effects
+toward zero) and $\lambda_j$ is the **local** shrinkage parameter
+(allowing individual markers to escape). The recommended scale is
+$\tau_0 = \frac{p_0}{(p - p_0)\sqrt{n}}$ where $p_0$ is the expected
+number of non-zero effects.
+
+### Comparing shrinkage profiles
+
+The key distinction among these priors lies in their tail behaviour:
+
+| Prior | Peak at zero | Tail | Shrinkage character |
+|-------|-------------|------|---------------------|
+| Gaussian (ridge) | Moderate | Light (exponential decay) | Uniform shrinkage |
+| Double-exponential (LASSO) | Sharp | Moderate (exponential) | Sparse, moderate tails |
+| Scaled-$t$ (BayesA) | Moderate | Heavy (polynomial) | Marker-specific variance |
+| Horseshoe | Very sharp | Very heavy (Cauchy) | Near-zero or unshrunk |
+
+
+## Setup
+
+```{r packages, message=FALSE}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+```
+
+
+## Data preparation
+
+We construct a synthetic marker dataset with 50 markers, of which only
+5 have true non-zero effects. This mimics a common genomic selection
+scenario where most markers are null.
+
+```{r data-prep}
+# Load the bundled MET example and extract a subset
+data(met_example, package = "bayesreml")
+
+set.seed(2024)
+n <- 200
+p <- 50
+
+# Simulate marker matrix (centred, scaled)
+M <- matrix(sample(c(-1, 0, 1), n * p, replace = TRUE,
+                   prob = c(0.25, 0.5, 0.25)),
+            nrow = n, ncol = p)
+colnames(M) <- paste0("m", sprintf("%02d", 1:p))
+M <- scale(M)
+
+# True effects: 5 markers with non-zero effects
+true_effects <- rep(0, p)
+causal_idx <- c(5, 12, 23, 37, 44)
+true_effects[causal_idx] <- c(2.5, -1.8, 3.0, -2.2, 1.5)
+
+# Simulate phenotype
+sigma_e <- 2.0
+y <- 50 + M %*% true_effects + rnorm(n, 0, sigma_e)
+
+# Assemble data frame
+marker_df <- as.data.frame(M)
+marker_df$y <- as.numeric(y)
+marker_df$id <- factor(1:n)
+
+str(marker_df)
+```
+
+
+## Visualise prior densities
+
+Before fitting, compare the shrinkage priors visually:
+
+```{r prior-viz, fig.width=7, fig.height=5}
+x_grid <- seq(-6, 6, length.out = 1000)
+
+prior_df <- data.frame(
+  x = rep(x_grid, 4),
+  density = c(
+    dnorm(x_grid, 0, 1),
+    # Double-exponential (Laplace) with rate = 1
+    0.5 * exp(-abs(x_grid)),
+    # Scaled-t with df = 4
+    dt(x_grid, df = 4),
+    # Horseshoe approximation (standard Cauchy)
+    dcauchy(x_grid, 0, 1)
+  ),
+  Prior = rep(c("Gaussian (ridge)", "Double-exponential (LASSO)",
+                "Scaled-t (BayesA)", "Horseshoe"), each = length(x_grid))
+)
+
+prior_df$Prior <- factor(prior_df$Prior,
+  levels = c("Gaussian (ridge)", "Double-exponential (LASSO)",
+             "Scaled-t (BayesA)", "Horseshoe"))
+
+ggplot(prior_df, aes(x = x, y = density, colour = Prior, linetype = Prior)) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = c("#999999", "#E69F00", "#56B4E9", "#D55E00")) +
+  coord_cartesian(ylim = c(0, 0.6)) +
+  labs(
+    x = expression(alpha[j]),
+    y = "Density",
+    title = "Comparison of shrinkage priors",
+    subtitle = "Note the horseshoe's sharp spike at zero and heavy tails"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+**Interpretation:** The horseshoe prior concentrates more mass near zero
+than any other prior shown, yet its Cauchy tails allow truly large effects
+to remain essentially unshrunk. The double-exponential sits between the
+Gaussian and the heavy-tailed priors.
+
+
+## Model 16a: BayesA (scaled-$t$ slab)
+
+BayesA assigns marker-specific variances drawn from a scaled inverse
+chi-squared distribution. In `bayesreml`, this is specified via custom
+prior arguments using `prior_type = "bayes_a"`:
+
+```{r m16a-fit}
+# Construct the marker formula
+marker_terms <- paste0("m", sprintf("%02d", 1:p))
+marker_formula <- as.formula(
+  paste("y ~", paste(marker_terms, collapse = " + "))
+)
+
+m_16a <- bayesreml(
+  fixed      = marker_formula,
+  data       = marker_df,
+  prior_type = "bayes_a",
+  prior_args = list(df = 4, scale = 1),
+  n_samples  = 2000,
+  warmup     = 1000,
+  chains     = 4
+)
+
+summary(m_16a)
+```
+
+```{r m16a-effects}
+# Extract marker effects
+effects_16a <- coef(m_16a)[-1]  # drop intercept
+ci_16a <- confint(m_16a)[-1, ]
+
+effects_df_16a <- data.frame(
+  marker   = marker_terms,
+  position = 1:p,
+  estimate = effects_16a,
+  lower    = ci_16a[, 1],
+  upper    = ci_16a[, 2],
+  true     = true_effects,
+  causal   = position %in% causal_idx
+)
+```
+
+
+## Model 16b: Bayesian LASSO (double-exponential)
+
+The Bayesian LASSO uses a double-exponential prior with a
+hyperparameter $\lambda$ controlling the overall shrinkage intensity:
+
+```{r m16b-fit}
+m_16b <- bayesreml(
+  fixed      = marker_formula,
+  data       = marker_df,
+  prior_type = "bayes_lasso",
+  prior_args = list(lambda_shape = 1, lambda_rate = 0.1),
+  n_samples  = 2000,
+  warmup     = 1000,
+  chains     = 4
+)
+
+summary(m_16b)
+```
+
+```{r m16b-effects}
+effects_16b <- coef(m_16b)[-1]
+ci_16b <- confint(m_16b)[-1, ]
+
+effects_df_16b <- data.frame(
+  marker   = marker_terms,
+  position = 1:p,
+  estimate = effects_16b,
+  lower    = ci_16b[, 1],
+  upper    = ci_16b[, 2],
+  true     = true_effects,
+  causal   = position %in% causal_idx
+)
+```
+
+
+## Model 16c: Horseshoe (global-local shrinkage)
+
+The horseshoe prior is specified with a recommended global scale
+$\tau_0$ based on the expected sparsity:
+
+```{r m16c-fit}
+# Expected number of non-zero effects
+p0 <- 5
+tau0 <- p0 / ((p - p0) * sqrt(n))
+
+m_16c <- bayesreml(
+  fixed      = marker_formula,
+  data       = marker_df,
+  prior_type = "horseshoe",
+  prior_args = list(tau0 = tau0),
+  n_samples  = 2000,
+  warmup     = 1000,
+  chains     = 4
+)
+
+summary(m_16c)
+```
+
+```{r m16c-effects}
+effects_16c <- coef(m_16c)[-1]
+ci_16c <- confint(m_16c)[-1, ]
+
+effects_df_16c <- data.frame(
+  marker   = marker_terms,
+  position = 1:p,
+  estimate = effects_16c,
+  lower    = ci_16c[, 1],
+  upper    = ci_16c[, 2],
+  true     = true_effects,
+  causal   = position %in% causal_idx
+)
+```
+
+
+### Horseshoe local shrinkage parameters
+
+A distinctive feature of the horseshoe is the local shrinkage factor
+$\kappa_j = 1 / (1 + \lambda_j^2)$. Values near 1 indicate strong
+shrinkage (null markers); values near 0 indicate escape from shrinkage
+(signal markers).
+
+```{r m16c-kappa, fig.width=7, fig.height=4}
+# Extract local lambda draws from the greta environment
+lambda_draws <- m_16c$extras$horseshoe_lambdas
+kappa_j <- 1 / (1 + colMeans(lambda_draws)^2)
+
+kappa_df <- data.frame(
+  marker   = marker_terms,
+  position = 1:p,
+  kappa    = kappa_j,
+  causal   = (1:p) %in% causal_idx
+)
+
+ggplot(kappa_df, aes(x = position, y = kappa, colour = causal)) +
+  geom_point(size = 2.5) +
+  geom_segment(aes(xend = position, y = 0, yend = kappa), linewidth = 0.4) +
+  scale_colour_manual(values = c("FALSE" = "grey60", "TRUE" = "#D55E00"),
+                      labels = c("Null", "Causal"),
+                      name = "Marker type") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey40") +
+  labs(
+    x = "Marker position",
+    y = expression(kappa[j] == frac(1, 1 + lambda[j]^2)),
+    title = "Horseshoe local shrinkage factors",
+    subtitle = "Causal markers should have low kappa (escape shrinkage)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+## Shrinkage plot: estimated vs OLS
+
+Compare how each prior shrinks marker effects relative to ordinary
+least squares (OLS):
+
+```{r ols-fit}
+lm_ols <- lm(marker_formula, data = marker_df)
+ols_effects <- coef(lm_ols)[-1]
+```
+
+```{r shrinkage-plot, fig.width=8, fig.height=6}
+shrinkage_df <- data.frame(
+  marker = rep(marker_terms, 3),
+  ols    = rep(ols_effects, 3),
+  bayes  = c(effects_16a, effects_16b, effects_16c),
+  model  = rep(c("BayesA", "Bayesian LASSO", "Horseshoe"),
+               each = p),
+  causal = rep((1:p) %in% causal_idx, 3)
+)
+
+ggplot(shrinkage_df, aes(x = ols, y = bayes)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50") +
+  geom_point(aes(colour = causal, shape = causal), size = 2, alpha = 0.8) +
+  facet_wrap(~ model, scales = "free") +
+  scale_colour_manual(values = c("FALSE" = "grey60", "TRUE" = "#D55E00"),
+                      labels = c("Null", "Causal"), name = "Marker type") +
+  scale_shape_manual(values = c("FALSE" = 1, "TRUE" = 16),
+                     labels = c("Null", "Causal"), name = "Marker type") +
+  labs(
+    x = "OLS estimate",
+    y = "Bayesian posterior mean",
+    title = "Shrinkage patterns across regularisation priors",
+    subtitle = "Points below the diagonal are shrunk toward zero"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+```
+
+**Interpretation:** Null markers (grey) should cluster near the origin
+under all three priors. Causal markers (orange) should remain close to
+the diagonal under BayesA and horseshoe (heavy tails preserve signal),
+while the LASSO applies more uniform shrinkage. The horseshoe typically
+shows the sharpest separation between null and causal markers.
+
+
+## Manhattan plot of marker effects
+
+```{r manhattan, fig.width=8, fig.height=5}
+manhattan_df <- bind_rows(
+  effects_df_16a %>% mutate(model = "BayesA"),
+  effects_df_16b %>% mutate(model = "Bayesian LASSO"),
+  effects_df_16c %>% mutate(model = "Horseshoe")
+)
+
+ggplot(manhattan_df, aes(x = position, y = abs(estimate))) +
+  geom_segment(aes(xend = position, y = 0, yend = abs(estimate),
+                   colour = causal),
+               linewidth = 0.6) +
+  geom_point(aes(colour = causal), size = 2) +
+  facet_wrap(~ model, ncol = 1) +
+  scale_colour_manual(values = c("FALSE" = "grey60", "TRUE" = "#D55E00"),
+                      labels = c("Null", "Causal"), name = "Marker type") +
+  # Add true effect positions
+  geom_point(data = manhattan_df %>% filter(causal),
+             aes(x = position, y = abs(true)),
+             shape = 4, size = 3, colour = "black", stroke = 1.2) +
+  labs(
+    x = "Marker position",
+    y = expression("|" * hat(alpha)[j] * "|"),
+    title = "Manhattan plot of absolute marker effects",
+    subtitle = "Crosses mark true effect magnitudes"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+```
+
+
+## Prior vs posterior density overlay
+
+Visualise how the data updates the prior for selected causal markers:
+
+```{r prior-posterior, fig.width=8, fig.height=6}
+# Extract posterior draws for causal markers
+causal_names <- marker_terms[causal_idx]
+
+# Get MCMC draws
+draws_matrix <- as.matrix(m_16c$greta$draws)
+causal_draws <- draws_matrix[, causal_names]
+
+# Build data frame for plotting
+pp_list <- list()
+for (j in seq_along(causal_names)) {
+  mk <- causal_names[j]
+  post_vals <- causal_draws[, j]
+
+  pp_list[[j]] <- data.frame(
+    marker = mk,
+    value  = c(post_vals, rnorm(length(post_vals), 0, 1)),
+    type   = rep(c("Posterior", "Prior"), each = length(post_vals))
+  )
+}
+pp_df <- bind_rows(pp_list)
+
+ggplot(pp_df, aes(x = value, fill = type)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  facet_wrap(~ marker, scales = "free", ncol = 3) +
+  geom_vline(data = data.frame(
+    marker = causal_names,
+    true   = true_effects[causal_idx]
+  ), aes(xintercept = true), linetype = "dashed", colour = "black") +
+  scale_fill_manual(values = c("Prior" = "#56B4E9", "Posterior" = "#D55E00"),
+                    name = NULL) +
+  labs(
+    x = expression(alpha[j]),
+    y = "Density",
+    title = "Prior vs posterior for causal markers (Horseshoe)",
+    subtitle = "Dashed lines mark true values"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+**Interpretation:** For causal markers with strong signal, the posterior
+should shift substantially away from the prior and concentrate around the
+true value (dashed line). The degree of prior-to-posterior updating
+reflects the information content of the data for each marker.
+
+
+## Cross-validation accuracy
+
+Evaluate predictive accuracy using 5-fold cross-validation:
+```{r cv-setup}
+set.seed(42)
+n_folds <- 5
+fold_id <- sample(rep(1:n_folds, length.out = n))
+
+cv_results <- data.frame(
+  fold   = integer(),
+  model  = character(),
+  cor    = numeric(),
+  rmse   = numeric()
+)
+```
+
+```{r cv-loop}
+for (k in 1:n_folds) {
+  train_df <- marker_df[fold_id != k, ]
+  test_df  <- marker_df[fold_id == k, ]
+
+  # BayesA
+  fit_a <- bayesreml(
+    fixed = marker_formula, data = train_df,
+    prior_type = "bayes_a",
+    prior_args = list(df = 4, scale = 1),
+    n_samples = 1000, warmup = 500, chains = 2
+  )
+  pred_a <- predict(fit_a, newdata = test_df)
+  cv_results <- rbind(cv_results, data.frame(
+    fold = k, model = "BayesA",
+    cor  = cor(test_df$y, pred_a),
+    rmse = sqrt(mean((test_df$y - pred_a)^2))
+  ))
+
+  # Bayesian LASSO
+  fit_b <- bayesreml(
+    fixed = marker_formula, data = train_df,
+    prior_type = "bayes_lasso",
+    prior_args = list(lambda_shape = 1, lambda_rate = 0.1),
+    n_samples = 1000, warmup = 500, chains = 2
+  )
+  pred_b <- predict(fit_b, newdata = test_df)
+  cv_results <- rbind(cv_results, data.frame(
+    fold = k, model = "Bayesian LASSO",
+    cor  = cor(test_df$y, pred_b),
+    rmse = sqrt(mean((test_df$y - pred_b)^2))
+  ))
+
+  # Horseshoe
+  fit_c <- bayesreml(
+    fixed = marker_formula, data = train_df,
+    prior_type = "horseshoe",
+    prior_args = list(tau0 = tau0),
+    n_samples = 1000, warmup = 500, chains = 2
+  )
+  pred_c <- predict(fit_c, newdata = test_df)
+  cv_results <- rbind(cv_results, data.frame(
+    fold = k, model = "Horseshoe",
+    cor  = cor(test_df$y, pred_c),
+    rmse = sqrt(mean((test_df$y - pred_c)^2))
+  ))
+}
+```
+
+```{r cv-summary}
+cv_summary <- cv_results %>%
+  group_by(model) %>%
+  summarise(
+    mean_cor  = mean(cor),
+    sd_cor    = sd(cor),
+    mean_rmse = mean(rmse),
+    sd_rmse   = sd(rmse),
+    .groups = "drop"
+  )
+
+print(cv_summary)
+```
+
+```{r cv-plot, fig.width=6, fig.height=4}
+ggplot(cv_results, aes(x = model, y = cor, fill = model)) +
+  geom_boxplot(width = 0.5, alpha = 0.7, show.legend = FALSE) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.6, show.legend = FALSE) +
+  scale_fill_manual(values = c("BayesA" = "#56B4E9",
+                                "Bayesian LASSO" = "#E69F00",
+                                "Horseshoe" = "#D55E00")) +
+  labs(
+    x = NULL,
+    y = "Prediction accuracy (correlation)",
+    title = "5-fold cross-validation: predictive accuracy"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+
+## Extending the prior specification
+
+These models require custom prior arguments beyond the default
+`prior_vc_sd`. The `prior_type` and `prior_args` parameters control
+the prior family:
+```{r prior-extension}
+# Default behaviour (Gaussian / ridge)
+m_ridge <- bayesreml(
+  fixed     = marker_formula,
+  data      = marker_df,
+  n_samples = 1000,
+  warmup    = 500,
+  chains    = 4
+)
+
+# Custom: spike-and-slab (point mass at zero + Gaussian slab)
+m_spike_slab <- bayesreml(
+  fixed      = marker_formula,
+  data       = marker_df,
+  prior_type = "spike_slab",
+  prior_args = list(
+    spike_prob  = 0.9,     # prior probability of being zero
+    slab_sd     = 2.0      # SD of the Gaussian slab
+  ),
+  n_samples  = 2000,
+  warmup     = 1000,
+  chains     = 4
+)
+
+summary(m_spike_slab)
+```
+
+### Spike-and-slab inclusion probabilities
+
+```{r spike-slab-inclusion, fig.width=7, fig.height=4}
+# Extract posterior inclusion probabilities (PIP)
+pip <- m_spike_slab$extras$inclusion_prob
+
+pip_df <- data.frame(
+  marker   = marker_terms,
+  position = 1:p,
+  pip      = pip,
+  causal   = (1:p) %in% causal_idx
+)
+
+ggplot(pip_df, aes(x = position, y = pip, colour = causal)) +
+  geom_segment(aes(xend = position, y = 0, yend = pip), linewidth = 0.5) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(values = c("FALSE" = "grey60", "TRUE" = "#D55E00"),
+                      labels = c("Null", "Causal"), name = "Marker type") +
+  labs(
+    x = "Marker position",
+    y = "Posterior inclusion probability",
+    title = "Spike-and-slab variable selection",
+    subtitle = "Markers with PIP > 0.5 are selected (median probability model)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+## Inspecting generated greta code
+
+Because these regularised models use non-standard priors, the generated
+greta code is more involved than for standard mixed models:
+
+```{r generated-code}
+cat(m_16c$extras$code)
+```
+
+This reveals the internal construction of the horseshoe hierarchy:
+global scale $\tau$, local scales $\lambda_j$, and the resulting
+marker effects $\alpha_j = \lambda_j \tau z_j$ where $z_j \sim
+\mathcal{N}(0, 1)$.
+
+
+## Summary
+
+| Model | Prior | Shrinkage character | Best for |
+|-------|-------|--------------------|----|
+| `m_16a` | Scaled-$t$ (BayesA) | Marker-specific variance, heavy tails | Many small + few large effects |
+| `m_16b` | Double-exponential (LASSO) | $L_1$-type, uniform shrinkage | Moderate sparsity |
+| `m_16c` | Horseshoe | Near-zero or unshrunk | Strong sparsity, few true signals |
+
+Key takeaways:
+
+1. Regularised Bayesian models go beyond ASReml's capability by
+   leveraging greta's flexible prior specification.
+2. The choice of prior encodes assumptions about sparsity: use BayesA
+   when many markers may have small effects, horseshoe when you expect
+   few truly non-zero markers.
+3. Cross-validation accuracy helps select the appropriate prior for a
+   given dataset, but differences may be small when signal is strong.
+4. The horseshoe's local shrinkage factors ($\kappa_j$) provide
+   interpretable variable-selection information without requiring a
+   discrete spike-and-slab formulation.
+5. Prior-posterior overlay plots are essential for communicating how
+   much the data inform each parameter.
+6. The `prior_type` and `prior_args` interface allows users to specify
+   custom shrinkage priors that are translated into native greta code.

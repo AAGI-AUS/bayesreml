@@ -1,0 +1,588 @@
+---
+title: "Tutorial 11: Regression Models"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Tutorial 11: Regression Models}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+This tutorial covers regression models within the mixed model framework,
+progressing from simple random-intercept regression to models with correlated
+random slopes and intercepts. We use two classic longitudinal datasets:
+`nlme::Orthodont` (orthodontic distance measurements) and `lme4::sleepstudy`
+(reaction time under sleep deprivation).
+
+**Models covered:**
+
+| Model | Description | Key feature |
+|-------|-------------|-------------|
+| m_11a | Fixed regression + random intercept | Subject-specific baselines |
+| m_11b | Polynomial regression + random slopes | Legendre-style curvilinear trends |
+| m_11c | Spline regression + random intercept | Flexible nonlinear response |
+| m_11d | Random intercept + slope with covariance | Full `us(Subject)` structure |
+
+**Packages required:**
+
+```{r packages}
+library(bayesreml)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(nlme)
+library(lme4)
+library(bayesplot)
+library(marginaleffects)
+library(patchwork)
+```
+
+---
+
+## 1. Data preparation
+
+### Orthodont data
+
+The `Orthodont` dataset from the `nlme` package records the distance (mm) from
+the pituitary to the pterygomaxillary fissure for 27 children (16 males, 11
+females) measured at ages 8, 10, 12, and 14.
+
+```{r data-ortho}
+data(Orthodont, package = "nlme")
+orth <- as.data.frame(Orthodont)
+orth$Subject <- factor(orth$Subject)
+orth$age_c <- orth$age - mean(orth$age)   # centre age for interpretation
+str(orth)
+```
+
+The mathematical model for a random intercept regression is:
+
+$$
+y_{ij} = \beta_0 + \beta_1 \, \text{age}_{ij} + u_j + \varepsilon_{ij}
+$$
+
+where $u_j \sim \mathcal{N}(0, \sigma_u^2)$ is the subject-specific intercept
+deviation and $\varepsilon_{ij} \sim \mathcal{N}(0, \sigma_e^2)$.
+
+### Sleepstudy data
+
+The `sleepstudy` dataset from `lme4` records average reaction time (ms) for 18
+subjects over 10 days of sleep deprivation.
+
+```{r data-sleep}
+data(sleepstudy, package = "lme4")
+sleep <- sleepstudy
+sleep$Subject <- factor(sleep$Subject)
+sleep$Days_c <- sleep$Days - mean(sleep$Days)
+str(sleep)
+```
+
+### Exploratory plots
+
+```{r eda-spaghetti, fig.height = 4}
+p_orth <- ggplot(orth, aes(x = age, y = distance, group = Subject,
+                            colour = Sex)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 1.5) +
+  labs(title = "Orthodont: subject-specific growth curves",
+       x = "Age (years)", y = "Distance (mm)") +
+  theme_minimal()
+
+p_sleep <- ggplot(sleep, aes(x = Days, y = Reaction, group = Subject)) +
+  geom_line(alpha = 0.5, colour = "steelblue") +
+  geom_point(size = 1.2, colour = "steelblue") +
+  labs(title = "Sleepstudy: reaction time by days of deprivation",
+       x = "Days of sleep deprivation", y = "Reaction time (ms)") +
+  theme_minimal()
+
+p_orth + p_sleep
+```
+
+The spaghetti plots reveal clear between-subject variability in both intercepts
+and slopes --- motivating random effects for both parameters.
+
+---
+
+## 2. Model 11a: Fixed regression + random intercept
+
+### Fitting
+
+This is the simplest regression mixed model: a fixed linear trend in age with
+subject-specific intercept deviations.
+
+```{r m11a-fit}
+m_11a <- bayesreml(
+  fixed   = distance ~ age_c + Sex,
+  random  = ~ Subject,
+  data    = orth,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+summary(m_11a)
+```
+
+The `bayesreml` syntax mirrors ASReml: `fixed` takes a two-sided formula,
+`random` takes a one-sided formula listing random terms.
+
+### Diagnostics
+
+```{r m11a-diag, fig.height = 6}
+# Trace plots for convergence
+plot(m_11a, type = "diagnostics")
+
+# Residual checks
+plot(m_11a, type = "residuals")
+```
+
+### Interpretation
+
+```{r m11a-interpret}
+# Fixed effects with credible intervals
+coef(m_11a)
+confint(m_11a)
+
+# Variance components: sigma_u^2 (Subject) and sigma_e^2 (residual)
+m_11a$extras$variance_comps
+
+# Intraclass correlation coefficient (ICC)
+vc <- m_11a$extras$variance_comps
+sigma2_u <- vc$estimate[vc$component == "Subject"]
+sigma2_e <- vc$estimate[vc$component == "Residual"]
+icc <- sigma2_u / (sigma2_u + sigma2_e)
+cat("ICC =", round(icc, 3), "\n")
+```
+
+The ICC quantifies the proportion of total variance attributable to
+between-subject differences. An ICC near 1 implies subjects differ greatly in
+their baseline distance, while an ICC near 0 suggests negligible clustering.
+
+### Subject-specific predictions (spaghetti with fitted lines)
+
+```{r m11a-spaghetti, fig.height = 5}
+# BLUPs give subject-specific intercept adjustments
+blups <- m_11a$extras$blups
+orth$fitted_11a <- fitted(m_11a)
+
+ggplot(orth, aes(x = age, y = distance, group = Subject, colour = Sex)) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  geom_line(aes(y = fitted_11a), linewidth = 0.7) +
+  labs(title = "Model 11a: Random intercept fitted lines",
+       x = "Age (years)", y = "Distance (mm)") +
+  theme_minimal()
+```
+
+### Comparison with lme4
+
+```{r m11a-compare}
+lmer_11a <- lmer(distance ~ age_c + Sex + (1 | Subject), data = orth)
+summary(lmer_11a)
+
+# Side-by-side fixed effects
+data.frame(
+  Parameter = names(coef(m_11a)),
+  bayesreml = round(coef(m_11a), 3),
+  lmer      = round(fixef(lmer_11a), 3)
+)
+```
+
+---
+
+## 3. Model 11b: Polynomial regression + random slopes (Legendre)
+
+### Mathematical formulation
+
+A quadratic growth model with random linear slopes:
+
+$$
+y_{ij} = \beta_0 + \beta_1 \, t_{ij} + \beta_2 \, t_{ij}^2
+         + u_{0j} + u_{1j} \, t_{ij} + \varepsilon_{ij}
+$$
+
+where $t_{ij}$ is the centred age. The Legendre polynomial approach uses
+orthogonal polynomials to reduce collinearity between the linear and quadratic
+terms.
+
+```{r m11b-legendre}
+# Create orthogonal polynomial basis
+orth$age_L1 <- poly(orth$age, degree = 2)[, 1]
+orth$age_L2 <- poly(orth$age, degree = 2)[, 2]
+```
+
+### Fitting
+
+```{r m11b-fit}
+m_11b <- bayesreml(
+  fixed   = distance ~ age_L1 + age_L2 + Sex,
+  random  = ~ Subject,
+  data    = orth,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+summary(m_11b)
+```
+
+### Is the quadratic term needed?
+
+We compare the linear-only model (m_11a, refitted with `age_L1`) against the
+quadratic model (m_11b) using the approximate DIC from `anova()`.
+
+```{r m11b-compare-poly}
+m_11a_L <- bayesreml(
+  fixed   = distance ~ age_L1 + Sex,
+  random  = ~ Subject,
+  data    = orth,
+  n_samples = 2000, warmup = 1000, chains = 4
+)
+
+anova(m_11a_L, m_11b)
+```
+
+A lower DIC for the quadratic model supports the inclusion of `age_L2`. However,
+if the difference is small, the principle of parsimony favours the simpler model.
+
+### Fitted curves with credible bands
+
+```{r m11b-curves, fig.height = 5}
+# Prediction grid (population-level, excluding random effects)
+new_grid <- expand.grid(
+  age     = seq(8, 14, by = 0.25),
+  Sex     = c("Male", "Female")
+)
+new_grid$age_L1 <- poly(new_grid$age, degree = 2,
+                         coefs = attr(poly(orth$age, 2), "coefs"))[, 1]
+new_grid$age_L2 <- poly(new_grid$age, degree = 2,
+                         coefs = attr(poly(orth$age, 2), "coefs"))[, 2]
+
+pred <- predict(m_11b, newdata = new_grid, se.fit = TRUE)
+new_grid$fit   <- pred$fit
+new_grid$se    <- pred$se.fit
+new_grid$lower <- new_grid$fit - 1.96 * new_grid$se
+new_grid$upper <- new_grid$fit + 1.96 * new_grid$se
+
+ggplot(new_grid, aes(x = age, y = fit, colour = Sex, fill = Sex)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(data = orth, aes(x = age, y = distance), size = 1, alpha = 0.4) +
+  labs(title = "Model 11b: Polynomial fit with 95% credible bands",
+       x = "Age (years)", y = "Distance (mm)") +
+  theme_minimal()
+```
+
+---
+
+## 4. Model 11c: Spline regression + random intercept
+
+Natural splines offer greater flexibility than polynomials for capturing
+nonlinear trends, especially when the relationship is not well-approximated by
+a low-degree polynomial.
+
+### Setup
+
+```{r m11c-spline-setup}
+library(splines)
+
+# Use the sleepstudy data for a longer time series
+sleep$Days_ns1 <- ns(sleep$Days, df = 3)[, 1]
+sleep$Days_ns2 <- ns(sleep$Days, df = 3)[, 2]
+sleep$Days_ns3 <- ns(sleep$Days, df = 3)[, 3]
+```
+
+The natural spline basis with 3 degrees of freedom partitions the `Days` axis
+into segments connected smoothly at internal knots:
+
+$$
+y_{ij} = \beta_0 + \sum_{k=1}^{3} \beta_k \, B_k(\text{Days}_{ij})
+         + u_j + \varepsilon_{ij}
+$$
+
+where $B_k(\cdot)$ are the natural spline basis functions.
+
+### Fitting
+
+```{r m11c-fit}
+m_11c <- bayesreml(
+  fixed   = Reaction ~ Days_ns1 + Days_ns2 + Days_ns3,
+  random  = ~ Subject,
+  data    = sleep,
+  n_samples = 2000,
+  warmup    = 1000,
+  chains    = 4
+)
+summary(m_11c)
+```
+
+### Fitted spline curves
+
+```{r m11c-curves, fig.height = 5}
+# Population-level prediction
+days_seq <- data.frame(Days = seq(0, 9, by = 0.1))
+ns_basis <- ns(days_seq$Days, df = 3,
+               knots = attr(ns(sleep$Days, df = 3), "knots"),
+               Boundary.knots = attr(ns(sleep$Days, df = 3), "Boundary.knots"))
+days_seq$Days_ns1 <- ns_basis[, 1]
+days_seq$Days_ns2 <- ns_basis[, 2]
+days_seq$Days_ns3 <- ns_basis[, 3]
+
+pred_c <- predict(m_11c, newdata = days_seq, se.fit = TRUE)
+days_seq$fit   <- pred_c$fit
+days_seq$lower <- pred_c$fit - 1.96 * pred_c$se.fit
+days_seq$upper <- pred_c$fit + 1.96 * pred_c$se.fit
+
+ggplot() +
+  geom_ribbon(data = days_seq, aes(x = Days, ymin = lower, ymax = upper),
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(data = days_seq, aes(x = Days, y = fit),
+            colour = "steelblue", linewidth = 1.2) +
+  geom_point(data = sleep, aes(x = Days, y = Reaction),
+             alpha = 0.4, size = 1.5) +
+  labs(title = "Model 11c: Natural spline fit with 95% credible band",
+       x = "Days of sleep deprivation", y = "Reaction time (ms)") +
+  theme_minimal()
+```
+
+### Comparison: spline vs linear
+
+```{r m11c-vs-linear}
+m_11c_lin <- bayesreml(
+  fixed   = Reaction ~ Days_c,
+  random  = ~ Subject,
+  data    = sleep,
+  n_samples = 2000, warmup = 1000, chains = 4
+)
+
+anova(m_11c_lin, m_11c)
+```
+
+For the sleepstudy data, the linear model typically fits well --- the spline
+model serves as a check that the linearity assumption is not substantially
+violated.
+
+---
+
+## 5. Model 11d: Random intercept + slope with covariance
+
+### Mathematical formulation
+
+The most general two-level random regression model allows both intercepts and
+slopes to vary by subject, with an unstructured covariance matrix:
+
+$$
+y_{ij} = \beta_0 + \beta_1 \, \text{Days}_{ij}
+         + u_{0j} + u_{1j} \, \text{Days}_{ij} + \varepsilon_{ij}
+$$
+
+$$
+\begin{pmatrix} u_{0j} \\ u_{1j} \end{pmatrix}
+\sim \mathcal{N}\!\left(
+  \begin{pmatrix} 0 \\ 0 \end{pmatrix},
+  \begin{pmatrix}
+    \sigma_{u_0}^2        & \rho \, \sigma_{u_0} \sigma_{u_1} \\
+    \rho \, \sigma_{u_0} \sigma_{u_1} & \sigma_{u_1}^2
+  \end{pmatrix}
+\right)
+$$
+
+The correlation $\rho$ describes whether subjects with higher intercepts
+(baseline reaction time) tend to have steeper or shallower slopes (rate of
+deterioration with sleep deprivation).
+
+### Fitting with bayesreml
+
+In ASReml syntax, correlated random intercepts and slopes use `us()`:
+
+```{r m11d-fit}
+m_11d <- bayesreml(
+  fixed   = Reaction ~ Days,
+  random  = ~ us(Days, Subject),
+  data    = sleep,
+  n_samples = 3000,
+  warmup    = 1500,
+  chains    = 4
+)
+summary(m_11d)
+```
+
+### Variance components and correlation
+
+```{r m11d-vc}
+# Variance components
+m_11d$extras$variance_comps
+
+# Extract draws of the correlation parameter
+draws <- do.call(rbind, lapply(m_11d$greta$draws, as.matrix))
+```
+
+### Posterior of the slope-intercept correlation
+
+```{r m11d-corr-posterior, fig.height = 4}
+# Look for the correlation or covariance parameters in the draws
+cov_cols <- grep("cov|cor|rho", colnames(draws), value = TRUE, ignore.case = TRUE)
+cat("Covariance/correlation parameters:", cov_cols, "\n")
+
+# If correlation is not directly sampled, compute from variance components
+# rho = sigma_01 / sqrt(sigma_0^2 * sigma_1^2)
+# The exact column names depend on bayesreml's parameterisation; inspect:
+head(colnames(draws), 20)
+
+# Example: plot posterior of the correlation
+if (length(cov_cols) > 0) {
+  rho_draws <- draws[, cov_cols[1]]
+
+  ggplot(data.frame(rho = rho_draws), aes(x = rho)) +
+    geom_histogram(bins = 50, fill = "steelblue", colour = "white", alpha = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+    labs(title = "Posterior distribution of intercept-slope correlation",
+         x = expression(rho), y = "Count") +
+    theme_minimal()
+}
+```
+
+A positive $\rho$ would indicate that subjects with inherently slower reaction
+times (high intercept) also show faster deterioration (steep slope). A negative
+$\rho$ suggests a compensatory pattern.
+
+### Subject-specific fitted lines (spaghetti with model overlay)
+
+```{r m11d-spaghetti, fig.height = 5}
+sleep$fitted_11d <- fitted(m_11d)
+
+ggplot(sleep, aes(x = Days, y = Reaction, group = Subject)) +
+  geom_point(alpha = 0.4, size = 1.5, colour = "grey40") +
+  geom_line(aes(y = fitted_11d), colour = "steelblue", linewidth = 0.6) +
+  labs(title = "Model 11d: Subject-specific regression lines",
+       subtitle = "Random intercept + slope with covariance",
+       x = "Days of sleep deprivation", y = "Reaction time (ms)") +
+  theme_minimal()
+```
+
+### Comparison with lme4
+
+```{r m11d-compare}
+lmer_11d <- lmer(Reaction ~ Days + (Days | Subject), data = sleep)
+summary(lmer_11d)
+
+# Compare fixed effects
+data.frame(
+  Parameter = names(coef(m_11d)),
+  bayesreml = round(coef(m_11d), 3),
+  lmer      = round(fixef(lmer_11d), 3)
+)
+
+# Compare variance components
+VarCorr(lmer_11d)
+m_11d$extras$variance_comps
+```
+
+### Prediction for a new subject
+
+For a new (unobserved) subject, the random effects are integrated out. The
+prediction is based solely on the population-level fixed effects, with
+uncertainty reflecting both the fixed effect uncertainty and the random effect
+variance.
+
+```{r m11d-newsubject, fig.height = 4}
+new_subj <- data.frame(Days = 0:9)
+
+pred_new <- predict(m_11d, newdata = new_subj, se.fit = TRUE)
+new_subj$fit   <- pred_new$fit
+new_subj$lower <- pred_new$fit - 1.96 * pred_new$se.fit
+new_subj$upper <- pred_new$fit + 1.96 * pred_new$se.fit
+
+ggplot(new_subj, aes(x = Days, y = fit)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "coral", alpha = 0.25) +
+  geom_line(colour = "coral", linewidth = 1.2) +
+  geom_point(data = sleep, aes(x = Days, y = Reaction),
+             alpha = 0.2, size = 1, colour = "grey50") +
+  labs(title = "Prediction for a new (unobserved) subject",
+       subtitle = "Population mean with 95% credible interval",
+       x = "Days of sleep deprivation", y = "Reaction time (ms)") +
+  theme_minimal()
+```
+
+### Marginal effects: average slope
+
+```{r m11d-marginal}
+# marginaleffects: estimate the average marginal effect of Days
+slopes_11d <- avg_slopes(m_11d, variables = "Days")
+slopes_11d
+
+# Plot slopes by subject (if subject-specific slopes available)
+slopes_subj <- slopes(m_11d, variables = "Days", by = "Subject")
+ggplot(slopes_subj, aes(x = reorder(Subject, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high),
+                  colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+  coord_flip() +
+  labs(title = "Subject-specific slopes (marginaleffects)",
+       x = "Subject", y = "Estimated slope (ms/day)") +
+  theme_minimal()
+```
+
+---
+
+## 6. Summary and key takeaways
+
+```{r summary-table}
+# Compare all Orthodont models (m_11a, m_11a_L, m_11b)
+anova(m_11a, m_11b)
+
+# Compare sleepstudy models (m_11c_lin, m_11c, m_11d)
+anova(m_11c_lin, m_11c, m_11d)
+```
+
+### Practical guidelines
+
+1. **Always centre continuous predictors** before fitting. This improves MCMC
+   mixing and makes intercept interpretation meaningful (the predicted value at
+   the mean of the covariate).
+
+2. **Start simple**: fit a random intercept model first. Add random slopes only
+   when the spaghetti plot shows clear slope variation across subjects.
+
+3. **Orthogonal polynomials** (Legendre) reduce collinearity and improve
+   convergence relative to raw polynomials.
+
+4. **Splines** offer flexibility but add parameters. Use them when the
+   functional form is unknown or when polynomial models show systematic
+   residual patterns.
+
+5. **The intercept-slope correlation** ($\rho$) is often scientifically
+   interesting. In the sleepstudy example, it tells us whether subjects who are
+   initially fast also deteriorate more quickly under sleep deprivation.
+
+6. **Prediction for new subjects** uses only the population-level (fixed)
+   effects. The credible interval is wider than for observed subjects because it
+   integrates over the random effect distribution.
+
+### Code generated by bayesreml
+
+To inspect the greta code that bayesreml generated for any model:
+
+```{r show-code}
+cat(m_11d$extras$code)
+```
+
+This transparency is a core design principle: the user can always see, modify,
+and re-run the underlying Bayesian model.
+
+---
+
+## Session information
+
+```{r session}
+sessionInfo()
+```
