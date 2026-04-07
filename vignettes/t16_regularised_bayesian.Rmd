@@ -237,7 +237,7 @@ effects_df_16a <- data.frame(
   lower    = ci_16a[, 1],
   upper    = ci_16a[, 2],
   true     = true_effects,
-  causal   = position %in% causal_idx
+  causal   = (1:p) %in% causal_idx
 )
 ```
 
@@ -272,7 +272,7 @@ effects_df_16b <- data.frame(
   lower    = ci_16b[, 1],
   upper    = ci_16b[, 2],
   true     = true_effects,
-  causal   = position %in% causal_idx
+  causal   = (1:p) %in% causal_idx
 )
 ```
 
@@ -311,7 +311,7 @@ effects_df_16c <- data.frame(
   lower    = ci_16c[, 1],
   upper    = ci_16c[, 2],
   true     = true_effects,
-  causal   = position %in% causal_idx
+  causal   = (1:p) %in% causal_idx
 )
 ```
 

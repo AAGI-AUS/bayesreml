@@ -36,7 +36,7 @@ This tutorial demonstrates four heterogeneous variance formulations:
 | m_8d  | Heterogeneous genotype variance by environment | `random = ~ at(env):geno` |
 
 **Dataset.** We use `agridat::barrero.maize`, a large MET dataset with
-approximately 4700 observations across multiple environments, known to
+approximately 14,500 observations across multiple environments, known to
 exhibit heterogeneous residual variance.
 
 **Prerequisites:**

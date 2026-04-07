@@ -25,7 +25,7 @@ ASReml modelling framework. You will learn how to:
 - Produce scree plots and biplots
 
 We use `agridat::yan.winterwheat` for FA models and
-`agridat::kempton.barley.uniform` for spatial correlation structures.
+`agridat::kempton.barley.uniformity` for spatial correlation structures.
 
 ## Mathematical background
 
@@ -76,12 +76,12 @@ library(patchwork)
 ### Data: Kempton barley uniform trial
 
 ```{r data-kempton}
-data(kempton.barley.uniform, package = "agridat")
-barley <- kempton.barley.uniform
+data(kempton.barley.uniformity, package = "agridat")
+barley <- kempton.barley.uniformity
 
 str(barley)
-# Variables: gen, rep, row, col, yield
-# A uniformity trial with known spatial structure
+# Variables: row, col, yield
+# A uniformity trial (no treatment factors) with known spatial structure
 ```
 
 ```{r barley-explore, fig.width=7, fig.height=5}
@@ -106,8 +106,7 @@ structure:
 
 ```{r m17a-fit}
 m_17a <- bayesreml(
-  fixed   = yield ~ gen,
-  random  = ~ rep,
+  fixed   = yield ~ 1,
   rcov    = ~ ar1(row):ar1(col),
   data    = barley,
   n_samples = 2000,
@@ -130,8 +129,7 @@ cat("Col autocorrelation (rho_c):", round(rho_col, 3), "\n")
 ```{r m17a-compare}
 # Compare with independent residuals
 m_17a_iid <- bayesreml(
-  fixed   = yield ~ gen,
-  random  = ~ rep,
+  fixed   = yield ~ 1,
   data    = barley,
   n_samples = 2000,
   warmup    = 1000,

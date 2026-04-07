@@ -35,7 +35,7 @@ This tutorial demonstrates three spline formulations in `bayesreml`:
 | m_6c  | P-spline (penalised B-spline) | `random = ~ spl(Time, type = "ps", df = 20)` |
 
 **Dataset.** We use `nlme::Soybean`, which records leaf weight over time for
-48 soybean plots across three genotypes and two planting years.
+48 soybean plots across two varieties and three planting years.
 
 **Prerequisites.** Install the following packages if not already available:
 

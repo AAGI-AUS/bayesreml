@@ -488,7 +488,8 @@ fit <- bayesreml(
   family = "gamma"
 )
 
-# Beta for proportion data
+# Beta for proportion data (create a proportion response from bin_y)
+dat$prop <- (dat$bin_y + 0.5) / 2   # transform to (0, 1) interval
 fit <- bayesreml(
   prop ~ env,
   random = ~ geno,

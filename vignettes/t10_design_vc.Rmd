@@ -29,10 +29,10 @@ This tutorial covers four design-based models with increasing complexity:
 
 | Model | Design | Random formula |
 |-------|--------|---------------|
-| m_10a | Nested: block within rep | `~ rep + rep:block` |
+| m_10a | Nested: manage within rep | `~ rep + rep:manage` |
 | m_10b | Three-way: rep within loc within year | `~ year + year:loc + year:loc:rep` |
-| m_10c | Partially nested (split-plot) | `~ rep + rep:whole_plot` |
-| m_10d | Block within rep (with genotype) | `~ rep + rep:block + gen` |
+| m_10c | Partially nested (split-plot) | `~ rep + rep:manage` |
+| m_10d | Manage within rep (with manage as random) | `~ rep + rep:manage + manage` |
 
 **Dataset.** We use `agridat::gomez.splitplot.subsample` for a split-plot
 design with sub-sampling, which provides a clean pedagogical example with
@@ -64,23 +64,23 @@ head(dat)
 dat <- dat %>%
   mutate(
     rep    = factor(rep),
-    gen    = factor(gen),
-    nitro  = factor(nitro),
-    # Create unique whole-plot ID (gen within rep)
-    wp     = interaction(rep, gen, drop = TRUE)
+    manage = factor(manage),
+    time   = factor(time),
+    # Create unique whole-plot ID (manage within rep)
+    wp     = interaction(rep, manage, drop = TRUE)
   )
 
-cat("Reps:     ", nlevels(dat$rep), "\n")
-cat("Genotypes:", nlevels(dat$gen), "\n")
-cat("Nitro:    ", nlevels(dat$nitro), "\n")
-cat("Obs:      ", nrow(dat), "\n")
+cat("Reps:      ", nlevels(dat$rep), "\n")
+cat("Management:", nlevels(dat$manage), "\n")
+cat("Time:      ", nlevels(dat$time), "\n")
+cat("Obs:       ", nrow(dat), "\n")
 ```
 
 This is a split-plot design where:
 
-- **Whole-plot factor:** genotype (`gen`), randomised within replicates
-- **Sub-plot factor:** nitrogen level (`nitro`), randomised within whole plots
-- **Sub-samples:** multiple observations per sub-plot
+- **Whole-plot factor:** management practice (`manage`), randomised within replicates
+- **Sub-plot factor:** time of application (`time`), randomised within whole plots
+- **Sub-samples:** two single-hill sampling units per sub-plot (`sample`)
 
 
 ## 2. Mathematical Background
@@ -155,8 +155,8 @@ We begin with a simple nested random effects model.
 
 ```{r m10a-fit}
 m_10a <- bayesreml(
-  fixed     = yield ~ nitro,
-  random    = ~ rep + rep:gen,
+  fixed     = height ~ time,
+  random    = ~ rep + rep:manage,
   data      = dat,
   n_samples = 2000,
   warmup    = 1000,
@@ -254,8 +254,8 @@ whole plots.
 
 ```{r m10c-fit}
 m_10c <- bayesreml(
-  fixed     = yield ~ gen * nitro,
-  random    = ~ rep + rep:gen,
+  fixed     = height ~ manage * time,
+  random    = ~ rep + rep:manage,
   data      = dat,
   n_samples = 2000,
   warmup    = 1000,
@@ -271,29 +271,29 @@ summary(m_10c)
 vc_10c <- m_10c$extras$variance_comps
 print(vc_10c)
 
-cat("\nWhole-plot error (rep:gen):",
-    vc_10c$estimate[vc_10c$term == "rep:gen"], "\n")
+cat("\nWhole-plot error (rep:manage):",
+    vc_10c$estimate[vc_10c$term == "rep:manage"], "\n")
 cat("Sub-plot error (residual):",
     vc_10c$estimate[vc_10c$term == "residual"], "\n")
 ```
 
 The whole-plot error ($\sigma_{wp}^2$) is the variance component for
-`rep:gen`. In a properly specified split-plot analysis, the F-test for the
-whole-plot factor (genotype) should use $\sigma_{wp}^2$ as the denominator,
+`rep:manage`. In a properly specified split-plot analysis, the F-test for the
+whole-plot factor (management) should use $\sigma_{wp}^2$ as the denominator,
 not $\sigma^2$. The Bayesian model automatically accounts for this through
 the random effects structure.
 
 ### 5.2 Comparison with lme4
 
 ```{r m10c-lmer}
-m_lmer <- lmer(yield ~ gen * nitro + (1 | rep) + (1 | rep:gen), data = dat)
+m_lmer <- lmer(height ~ manage * time + (1 | rep) + (1 | rep:manage), data = dat)
 summary(m_lmer)
 
 # Compare VCs
 vc_lmer <- as.data.frame(VarCorr(m_lmer))
 
 vc_comp <- data.frame(
-  Source   = c("rep", "rep:gen", "residual"),
+  Source   = c("rep", "rep:manage", "residual"),
   lmer    = vc_lmer$vcov,
   bayesreml = vc_10c$estimate
 )
@@ -305,15 +305,15 @@ cat("\nCorrelation:", round(cor(vc_comp$lmer, vc_comp$bayesreml), 4), "\n")
 ```
 
 
-## 6. Model 10d: Block within Rep with Genotype as Random
+## 6. Model 10d: Management as Random (for BLUPs)
 
-Here we treat genotype as random (for BLUP prediction) alongside the design
+Here we treat management as random (for BLUP prediction) alongside the design
 structure.
 
 ```{r m10d-fit}
 m_10d <- bayesreml(
-  fixed     = yield ~ nitro,
-  random    = ~ gen + rep + rep:gen,
+  fixed     = height ~ time,
+  random    = ~ manage + rep + rep:manage,
   data      = dat,
   n_samples = 2000,
   warmup    = 1000,
@@ -328,12 +328,12 @@ summary(m_10d)
 ```{r m10d-blups}
 blups <- m_10d$extras$blups
 
-# Genotype BLUPs
-gen_blups <- blups %>%
-  filter(term == "gen") %>%
+# Management BLUPs
+manage_blups <- blups %>%
+  filter(term == "manage") %>%
   arrange(desc(estimate))
 
-print(gen_blups)
+print(manage_blups)
 
 # Rep BLUPs
 rep_blups <- blups %>%
@@ -342,16 +342,16 @@ rep_blups <- blups %>%
 print(rep_blups)
 ```
 
-### 6.2 Genotype BLUP Dot Plot
+### 6.2 Management BLUP Dot Plot
 
 ```{r m10d-dotplot}
-ggplot(gen_blups, aes(x = reorder(level, estimate), y = estimate)) +
+ggplot(manage_blups, aes(x = reorder(level, estimate), y = estimate)) +
   geom_pointrange(aes(ymin = lower, ymax = upper), colour = "steelblue") +
   coord_flip() +
   geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
   labs(
-    title = "Genotype BLUPs with 95% CrI",
-    x     = "Genotype",
+    title = "Management BLUPs with 95% CrI",
+    x     = "Management practice",
     y     = "BLUP"
   ) +
   theme_minimal()
@@ -376,7 +376,7 @@ same precision as the split-plot.
 # Extract variance components
 draws_mat <- as.matrix(m_10c$greta$draws)
 sigma_rep  <- draws_mat[, "sigma_rep"]
-sigma_wp   <- draws_mat[, "sigma_rep:gen"]
+sigma_wp   <- draws_mat[, "sigma_rep:manage"]
 sigma_e    <- draws_mat[, "sigma_resid"]
 
 # Posterior of relative efficiency
@@ -482,17 +482,17 @@ m_turnip$extras$variance_comps
 
 ```{r lmer-all}
 # Model 10a
-m_lmer_a <- lmer(yield ~ nitro + (1 | rep) + (1 | rep:gen), data = dat)
+m_lmer_a <- lmer(height ~ time + (1 | rep) + (1 | rep:manage), data = dat)
 
 # Model 10d
-m_lmer_d <- lmer(yield ~ nitro + (1 | gen) + (1 | rep) + (1 | rep:gen),
+m_lmer_d <- lmer(height ~ time + (1 | manage) + (1 | rep) + (1 | rep:manage),
                  data = dat)
 
 # Tabulate comparisons
 lmer_vc_d <- as.data.frame(VarCorr(m_lmer_d))
 
 vc_comp_d <- data.frame(
-  Source    = c("gen", "rep", "rep:gen", "residual"),
+  Source    = c("manage", "rep", "rep:manage", "residual"),
   lmer     = lmer_vc_d$vcov,
   bayesreml = m_10d$extras$variance_comps$estimate
 )
@@ -529,17 +529,17 @@ cat("\nCorrelation:", round(cor(vc_comp_d$lmer, vc_comp_d$bayesreml), 4), "\n")
 
 | Model | Random formula | Design |
 |-------|---------------|--------|
-| m_10a | `~ rep + rep:gen` | Simple nested |
+| m_10a | `~ rep + rep:manage` | Simple nested |
 | m_10b | `~ year + year:loc + year:loc:rep` | Three-way nested MET |
-| m_10c | `~ rep + rep:gen` (with `gen*nitro` fixed) | Split-plot |
-| m_10d | `~ gen + rep + rep:gen` | Split-plot with genotype BLUP |
+| m_10c | `~ rep + rep:manage` (with `manage*time` fixed) | Split-plot |
+| m_10d | `~ manage + rep + rep:manage` | Split-plot with management BLUPs |
 
 **Key take-aways:**
 
 1. Design structure must be reflected in the random formula. Nesting is
    specified with the colon operator: `rep:block` means block nested
    within rep.
-2. In split-plot designs, the whole-plot error (`rep:whole_plot`) is
+2. In split-plot designs, the whole-plot error (`rep:manage`) is
    distinct from the sub-plot residual. Omitting it inflates precision
    for whole-plot factor comparisons.
 3. Variance partitioning (ICC) quantifies how much variation originates

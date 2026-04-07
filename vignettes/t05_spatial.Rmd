@@ -30,7 +30,7 @@ This tutorial demonstrates how to:
 - Compare adjusted vs unadjusted BLUPs
 
 The dataset is `agridat::gilmour.serpentine`, a wheat trial on a
-10-row by 15-column field with serpentine harvesting pattern.
+22-row by 15-column field with serpentine harvesting pattern.
 
 
 ## Mathematical background

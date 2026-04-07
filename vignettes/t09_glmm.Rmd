@@ -339,7 +339,7 @@ ggplot(em_df, aes(x = Group, y = rate, colour = Age)) +
 ```{r m9c-overdisp}
 # Pearson chi-squared / residual df
 resid_pearson <- residuals(m_9c, type = "pearson")
-overdisp_ratio <- sum(resid_pearson^2) / m_9c$glm$df.residual
+overdisp_ratio <- sum(resid_pearson^2) / (nrow(quine) - length(coef(m_9c)))
 
 cat("Overdispersion ratio:", round(overdisp_ratio, 2), "\n")
 cat("(Values >> 1 suggest overdispersion; consider negative binomial)\n")

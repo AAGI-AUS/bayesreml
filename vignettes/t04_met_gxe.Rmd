@@ -28,7 +28,7 @@ decisions. This tutorial demonstrates how to:
 - Use `marginaleffects` for genotype contrasts
 - Compare with `sommer::mmer()`
 
-The dataset is `agridat::yan.winterwheat` (9 genotypes x 7
+The dataset is `agridat::yan.winterwheat` (18 genotypes x 9
 environments).
 
 

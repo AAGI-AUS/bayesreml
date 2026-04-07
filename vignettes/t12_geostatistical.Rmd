@@ -47,6 +47,7 @@ precision) matrix externally and passing it to `bayesreml` via the
 library(bayesreml)
 library(ggplot2)
 library(dplyr)
+library(tidyr)
 library(agridat)
 library(fields)     # for distance matrices and variogram tools
 library(Matrix)     # for sparse matrix operations
@@ -63,7 +64,7 @@ library(patchwork)
 data(durban.rowcol, package = "agridat")
 dat <- durban.rowcol
 dat$row_f <- factor(dat$row)
-dat$col_f <- factor(dat$col)
+dat$bed_f <- factor(dat$bed)
 
 str(dat)
 dim(dat)
@@ -73,11 +74,11 @@ table(dat$gen)[1:10]   # number of genotypes
 ### Spatial layout
 
 ```{r data-heatmap, fig.height = 4}
-ggplot(dat, aes(x = col, y = row, fill = yield)) +
+ggplot(dat, aes(x = bed, y = row, fill = yield)) +
   geom_tile() +
   scale_fill_viridis_c(option = "C") +
   labs(title = "Durban spring barley: raw yield heatmap",
-       x = "Column", y = "Row", fill = "Yield") +
+       x = "Bed", y = "Row", fill = "Yield") +
   coord_equal() +
   theme_minimal()
 ```
@@ -99,7 +100,7 @@ where $N(h)$ is the set of observation pairs separated by distance $h$.
 
 ```{r variogram-empirical, fig.height = 4}
 # Compute pairwise distances
-coords <- cbind(dat$col, dat$row)
+coords <- cbind(dat$bed, dat$row)
 dists  <- as.matrix(dist(coords))
 
 # Empirical variogram (binned)
@@ -185,7 +186,7 @@ make_matern <- function(coords, range_param, nu = 1.5) {
 }
 
 # Construct for the durban data
-coords <- cbind(dat$col, dat$row)
+coords <- cbind(dat$bed, dat$row)
 
 # Initial range estimate from empirical variogram (eyeball ~5 units)
 R_matern <- make_matern(coords, range_param = 5, nu = 1.5)
@@ -313,7 +314,7 @@ dat$resid_12a <- residuals(m_12a)
 dat$fitted_12a <- fitted(m_12a)
 
 # Spatial residual map
-p_resid <- ggplot(dat, aes(x = col, y = row, fill = resid_12a)) +
+p_resid <- ggplot(dat, aes(x = bed, y = row, fill = resid_12a)) +
   geom_tile() +
   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
                        midpoint = 0) +
@@ -322,7 +323,7 @@ p_resid <- ggplot(dat, aes(x = col, y = row, fill = resid_12a)) +
   coord_equal() + theme_minimal()
 
 # Fitted spatial surface (kriging-like)
-p_fitted <- ggplot(dat, aes(x = col, y = row, fill = fitted_12a)) +
+p_fitted <- ggplot(dat, aes(x = bed, y = row, fill = fitted_12a)) +
   geom_tile() +
   scale_fill_viridis_c(option = "C") +
   labs(title = "Fitted spatial surface",
@@ -422,7 +423,7 @@ summary(m_12b)
 ```{r m12b-surface, fig.height = 4}
 dat$fitted_12b <- fitted(m_12b)
 
-ggplot(dat, aes(x = col, y = row, fill = fitted_12b)) +
+ggplot(dat, aes(x = bed, y = row, fill = fitted_12b)) +
   geom_tile() +
   scale_fill_viridis_c(option = "C") +
   labs(title = "Model 12b: SPDE-approximated spatial surface",
@@ -460,7 +461,7 @@ summary(m_12c)
 ```{r m12c-surface, fig.height = 4}
 dat$fitted_12c <- fitted(m_12c)
 
-ggplot(dat, aes(x = col, y = row, fill = fitted_12c)) +
+ggplot(dat, aes(x = bed, y = row, fill = fitted_12c)) +
   geom_tile() +
   scale_fill_viridis_c(option = "C") +
   labs(title = "Model 12c: Isotropic Gaussian spatial surface",
@@ -560,7 +561,7 @@ dat$resid_12c <- residuals(m_12c)
 dat$resid_12d <- residuals(m_12d)
 
 resid_long <- dat %>%
-  select(col, row, resid_12a, resid_12b, resid_12c, resid_12d) %>%
+  select(bed, row, resid_12a, resid_12b, resid_12c, resid_12d) %>%
   pivot_longer(starts_with("resid_"), names_to = "model",
                values_to = "residual") %>%
   mutate(model = recode(model,
@@ -570,7 +571,7 @@ resid_long <- dat %>%
     resid_12d = "12d: Anisotropic"
   ))
 
-ggplot(resid_long, aes(x = col, y = row, fill = residual)) +
+ggplot(resid_long, aes(x = bed, y = row, fill = residual)) +
   geom_tile() +
   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
                        midpoint = 0) +
